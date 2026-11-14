@@ -1,6 +1,6 @@
 # Kestrel phase 0 architecture
 
-Phase 0 freezes the memory layout and the two wire images the rest of the system is built on. It does not open sockets, build an HNSW graph, or write a WAL. Those are later phases, and they have to fit the layouts below without moving them.
+Phase 0 freezes the memory layout and the two wire images the rest of the system is built on. Phase 1 is the single-node engine on top of those layouts: one reactor thread per physical core, an HNSW index, and a WAL. The layouts below do not move.
 
 Host this was measured on, and that the defaults match:
 
@@ -167,7 +167,24 @@ CRC-32C parameters: init `0xFFFFFFFF`, xorout `0xFFFFFFFF`, reflected polynomial
 
 ## What phase 0 deliberately does not do
 
-- No `io_uring`, no `epoll`, no HTTP parser. The ring's `false` return is the hook those will block on.
-- No HNSW and no SIMD distance kernel. AVX2 is the compile target so Phase 1 can use 256-bit loads without a second ISA.
-- No WAL. The frame CRC is the checksum the WAL will reuse.
-- No hugepages. This kernel has none configured, and a failed `MAP_HUGETLB` is the wrong startup surprise.
+Phase 0 shipped none of the following. Phase 1 added the first three. Hugepages are still absent: this kernel has none configured, and a failed `MAP_HUGETLB` is the wrong startup surprise.
+
+- No `io_uring`, no `epoll`, no HTTP parser. The ring's `false` return is the hook those block on.
+- No HNSW and no SIMD distance kernel. AVX2 is the compile target so the distance kernel can use 256-bit loads.
+- No WAL. The frame CRC is the checksum the WAL reuses.
+
+## Phase 1 single-node engine
+
+Each core binds the same port with `SO_REUSEPORT`, pins itself to `reactor_cpus[i]`, and owns a private HNSW plus `wal_dir/core-N.wal`. A hit on core 0 is invisible to core 1. That split is the Phase 2 replication problem. The default is one core, so one process has one cache. Port 0 is resolved by the first socket; the rest bind the port `getsockname` returned.
+
+The poller is `io_uring` when `io_uring_queue_init` succeeds, otherwise level-triggered epoll. `--epoll` forces the fallback. io_uring sockets stay blocking: a non-blocking `recv` completes with `-EAGAIN` and the thread spins. epoll sockets are non-blocking and a ready fd is read until `EAGAIN`. One operation is in flight per direction. The completion already holds the bytes; the handler does not call `recv` again. Accept stops when the connection slab is empty and resumes when a connection is recycled. `SIGPIPE` is ignored and sends use `MSG_NOSIGNAL`.
+
+Hit path: parse the request in the connection buffer, feature-hash the prompt, HNSW search, write the cached text. It does not allocate and it does not sync the WAL. A miss proxies to an IPv4 upstream configured at startup. A hostname is rejected there; the request path does not resolve DNS. The fill appends one WAL record (`msync` of the touched pages, then `fdatasync`) and inserts the vector. If the log or the index refuses the record, the client still gets the upstream response.
+
+The embedder is a token feature hash. Identical text produces the same unit vector. Empty text is the zero vector and does not hit. Paraphrases are not near each other. The default hit threshold is 0.97 so only an identical prompt clears it. Replacing the embedder does not change the index: the index stores floats.
+
+HNSW is single-writer and has no lock. Dimension is padded up to a multiple of 8, capped at 1024. Vectors are 32-byte aligned and the distance kernel is AVX2 `vfmadd` (or NEON, or a scalar tail). Insert L2-normalizes. The search score is the dot product, which is cosine for those vectors. `insert` returns `kNilNode` (`0xffffffff`) when the table is full. The node table, links, and vectors are reserved up front.
+
+A WAL record is a version-1 frame with type `CacheEntry`. The payload is little-endian `u32 dimension`, `u32 text_len`, `u32 response_len`, `f32 vector[dimension]`, then the text and the response bytes. `recover` replays every good record. `NeedMore`, `BadCrc`, `BadMagic`, `BadLength`, and `BadVersion` truncate the tail to the last good offset and stop. A record whose dimension does not match the index is skipped and logged. Views returned by `read` point into the mapping and die at the next grow (`mremap` may move it) and at destruction.
+
+Client HTTP is Content-Length only. Chunked transfer is `Bad`: the clients this gateway is built for send a length, and a chunked body is not one buffer. `POST`/`PUT`/`PATCH` without a length is `Bad`. A message that cannot fit in the 64 KiB connection buffer is `TooLarge` and the server answers 413. Views point into that buffer. "Zero-copy" here means the parser does not allocate a string for the request. `recv` still copies out of the kernel; this is not registered-buffer DMA. A cache hit is a finite JSON or SSE body with `Content-Length`, so keep-alive does not depend on closing the socket. Upstream chunked responses are forwarded raw and de-chunked only into the cache scratch. The scratch is capped; past that the response is still forwarded and is not cached.

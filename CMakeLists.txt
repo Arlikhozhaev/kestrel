@@ -1,11 +1,11 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(kestrel VERSION 0.1.0 LANGUAGES CXX)
+project(kestrel VERSION 0.2.0 LANGUAGES CXX)
 
 # Phase 0 host this file was brought up on:
 #   Intel Core i7-8650U, 4 physical cores / 8 logical, SMT pairs (0,1) (2,3) (4,5) (6,7)
 #   L1d 32 KiB, L2 256 KiB, L3 8 MiB, cache line 64 B, no AVX-512
-#   g++ 13.3, kernel 6.6 WSL2, liburing 2.5 present but not linked yet
+#   g++ 13.3, kernel 6.6 WSL2, liburing 2.5 linked when pkg-config finds it
 # -march=native on this CPU is AVX2 + FMA + BMI2 + SSE4.2. It is not AVX-512.
 # Container builds that must be reproducible should pass -DKESTREL_MARCH=x86-64-v3
 # (that is the AVX2 baseline, and this CPU implements it).
@@ -34,15 +34,22 @@ endif()
 find_package(Threads REQUIRED)
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
-  pkg_check_modules(LIBURING QUIET liburing)
+  pkg_check_modules(LIBURING IMPORTED_TARGET QUIET liburing)
 endif()
-if(LIBURING_FOUND)
-  message(STATUS "liburing ${LIBURING_VERSION} detected, not linked until Phase 1")
+if(TARGET PkgConfig::LIBURING)
+  message(STATUS "liburing ${LIBURING_VERSION} linked")
 else()
-  message(STATUS "liburing not found; Phase 1 will fall back to epoll")
+  message(STATUS "liburing not found; the reactor uses epoll")
 endif()
 
-add_library(kestrel_core STATIC src/cpu.cpp)
+add_library(kestrel_core STATIC
+  src/cpu.cpp
+  src/hnsw.cpp
+  src/wal.cpp
+  src/feature_hash.cpp
+  src/http.cpp
+  src/server.cpp
+)
 target_include_directories(kestrel_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(kestrel_core PUBLIC cxx_std_20)
 target_compile_definitions(kestrel_core
@@ -53,6 +60,10 @@ target_compile_definitions(kestrel_core
     KESTREL_L2_BYTES=${KESTREL_L2_BYTES}
 )
 target_link_libraries(kestrel_core PUBLIC Threads::Threads)
+if(TARGET PkgConfig::LIBURING)
+  target_link_libraries(kestrel_core PUBLIC PkgConfig::LIBURING)
+  target_compile_definitions(kestrel_core PUBLIC KESTREL_HAS_LIBURING=1)
+endif()
 
 target_compile_options(kestrel_core PUBLIC
   -Wall
@@ -124,7 +135,14 @@ function(kestrel_test name source)
   endif()
 endfunction()
 
+add_executable(kestreld src/kestreld.cpp)
+target_link_libraries(kestreld PRIVATE kestrel_core)
+
 kestrel_test(spsc_ring_test tests/spsc_ring_test.cpp)
 kestrel_test(arena_slab_test tests/arena_slab_test.cpp)
 kestrel_test(frame_test tests/frame_test.cpp)
 kestrel_test(cpu_test tests/cpu_test.cpp)
+kestrel_test(hnsw_test tests/hnsw_test.cpp)
+kestrel_test(wal_test tests/wal_test.cpp)
+kestrel_test(http_test tests/http_test.cpp)
+kestrel_test(server_test tests/server_test.cpp)

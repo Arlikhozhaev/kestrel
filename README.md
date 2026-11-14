@@ -3,9 +3,10 @@
 C++20 self-hosted semantic cache and OpenAI-compatible inference gateway.
 Shared-nothing cores, no external database, no third-party proxy.
 
-**Status: Phase 0 of 4.** This tree is the in-process foundation. It does not
-listen on a socket, it does not cache a prompt, and it publishes no latency
-numbers. Those claims start when a test measures them.
+**Status: Phase 1 of 4.** One process binds a port, serves an identical prompt
+from the on-core cache, and proxies a miss to an IPv4 model server. The
+embedder is a feature hash, not a model: paraphrases do not hit. This tree
+publishes no latency numbers.
 
 ## Start here
 
@@ -14,6 +15,7 @@ numbers. Those claims start when a test measures them.
 | Memory layout, wire format, failure rules | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 | SPSC ring | [include/kestrel/spsc_ring.hpp](include/kestrel/spsc_ring.hpp) |
 | Frame v1 and CRC-32C | [include/kestrel/frame.hpp](include/kestrel/frame.hpp) |
+| Single-node engine | [include/kestrel/server.hpp](include/kestrel/server.hpp) |
 
 ## What is in this tree
 
@@ -22,19 +24,20 @@ numbers. Those claims start when a test measures them.
 - 32-byte `Event`, the descriptor the ring carries. Payload bytes stay in the arena.
 - Version-1 inter-node frame, 32-byte little-endian header, CRC-32C (the SSE4.2 polynomial).
 - Reactor pin set: one logical CPU per physical core, read from sysfs. On the development host (i7-8650U) that is `0, 2, 4, 6`.
+- One reactor thread per core (`io_uring`, or level-triggered epoll). Each core has its own HNSW and `core-N.wal`. A hit does not sync the log.
+- OpenAI-compatible `POST /v1/chat/completions` over HTTP/1.1. Cache hits are a finite JSON or SSE body with `Content-Length`.
 
 ## What is not in this tree
 
 | Phase | Contents | State |
 | --- | --- | --- |
 | 0 | Ring, arena, slab, event, frame | this tree |
-| 1 | `io_uring` or epoll, HTTP/SSE, HNSW, WAL | not started |
+| 1 | `io_uring` or epoll, HTTP/SSE, HNSW, WAL | this tree |
 | 2 | Consistent hashing, SWIM, replication, circuit breaker | not started |
 | 3 | HDR histograms, traces, chaos UI | not started |
 | 4 | `wrk2`/`k6` numbers, Distroless image | not started |
 
-`kestreld` and `kestrel-cli` are the planned binary names. Neither exists yet.
-`liburing` is detected at configure time and is not linked.
+`kestrel-cli` is not written yet. `liburing` is linked when pkg-config finds it; otherwise the reactor uses epoll.
 
 ## Build
 
@@ -59,3 +62,9 @@ ctest --test-dir build/tsan --output-on-failure
 `address` is AddressSanitizer plus UndefinedBehaviorSanitizer. ThreadSanitizer is a separate build; the two do not compose. On this WSL2 kernel, TSan aborts with `unexpected memory mapping` unless the test process disables ASLR. The TSan ctest target runs under `setarch -R`, which sets `ADDR_NO_RANDOMIZE` and does not change the instrumentation.
 
 GitHub Actions (`.github/workflows/ci.yml`) runs the same three builds on Ubuntu.
+
+```bash
+./build/release/kestreld --bind 127.0.0.1 --port 8080 --wal /tmp/kestrel-wal --upstream 127.0.0.1:8000
+```
+
+`--epoll` forces the epoll reactor. `--upstream` is `IPv4:PORT`. A miss with no upstream is a 502. `--help` prints the flags. Unknown flags exit 2.
