@@ -1,0 +1,173 @@
+# Kestrel phase 0 architecture
+
+Phase 0 freezes the memory layout and the two wire images the rest of the system is built on. It does not open sockets, build an HNSW graph, or write a WAL. Those are later phases, and they have to fit the layouts below without moving them.
+
+Host this was measured on, and that the defaults match:
+
+| | |
+| --- | --- |
+| CPU | Intel Core i7-8650U @ 1.90 GHz, Kaby Lake-R, x86_64 |
+| SMT | 4 physical cores, 8 logical. Pairs `(0,1) (2,3) (4,5) (6,7)` |
+| NUMA | one node, cpus 0–7 |
+| Caches | L1d 32 KiB 8-way, L2 256 KiB, L3 8 MiB, coherency line 64 B |
+| SIMD | AVX2, FMA, BMI1/2, SSE4.2. No AVX-512. `-march=native` does not emit AVX-512 |
+| Pages | 4096 B. `HugePages_Total` is 0, so the allocators do not request huge pages |
+| Toolchain | g++ 13.3.0, CMake, liburing 2.5 installed and not linked |
+| Kernel | 6.6.87 WSL2. `io_uring` symbols are in the kernel image; Phase 1 still has to probe `io_uring_queue_init` and fall back to epoll |
+
+Guest `pthread_setaffinity_np` works here. The hypervisor can still move the VM's vCPUs, so a latency number taken on this box is a development number, not the launch `p99.9` record.
+
+## What is locked
+
+- One reactor thread per physical core. `load_topology()` returns the lowest logical CPU of each core. On this host that is `0, 2, 4, 6`. Two hot threads on an SMT pair share a 32 KiB L1d and the same execution ports; that is a tail-latency failure, not extra capacity.
+- The SPSC index blocks are 128 bytes apart, not 64. Kaby Lake's adjacent-line prefetcher completes 128-byte aligned pairs, so `alignas(64)` between the producer and consumer indices still false-shares.
+- Index atomics are `std::uint64_t` and `is_always_lock_free`. The protocol is release on the publisher and acquire on the observer. Nothing on this path uses `memory_order_seq_cst`. On x86 TSO a seq_cst store is an `mfence`, and the ring does not need one.
+- The ring carries a 32-byte `Event`. The bytes it names live in the owning core's arena. A 512-deep ring is 16 KiB, half of L1d. The other half is the reactor's own hot state.
+- A slot array larger than L2 (default 256 KiB, `-DKESTREL_L2_BYTES=` to override) is a compile error. A ring that misses L2 is the `p99.9` cliff.
+- Checksums are CRC-32C (Castagnoli), the polynomial of the SSE4.2 `crc32` instruction. ISO-HDLC CRC-32 is a different polynomial and has no instruction on this CPU.
+- Core-local structures are single-threaded. Cross-core handoff is an SPSC ring per ordered pair, not a mutex queue and not an MPSC. A core that hears from N peers polls N inbound rings.
+
+## SPSC ring
+
+`kestrel::SpscRing<T, Capacity>` in `include/kestrel/spsc_ring.hpp`.
+
+`Capacity` is a power of two, at least 2, at most 2^32. `T` is nothrow move-constructible, nothrow move-assignable, and nothrow destructible. The object is stationary: copy and move are deleted, because the other thread holds the address.
+
+```
+offset 0     ProducerLine          128 bytes, 128-aligned
+             +0   atomic<uint64> write_pos     producer store-release
+                                               consumer load-acquire
+             +8   uint64 cached_read           producer only
+offset 128   ConsumerLine          128 bytes
+             +0   atomic<uint64> read_pos      consumer store-release
+                                               producer load-acquire
+             +8   uint64 cached_write          consumer only
+offset 256   Slot[Capacity]        packed at sizeof(T)
+                                   first slot aligned to max(64, alignof(T))
+```
+
+Slot index is `pos & (Capacity - 1)`. Positions are monotonic `uint64` counters, not masked in the atomic. Unsigned distance stays `<= Capacity`, including across wrap, which at 1e9 ops/sec is about 584 years out.
+
+Fast path, ring not full and not empty:
+
+1. Relaxed load of this thread's own index. That line is already in L1.
+2. Compare against the cached remote index. No coherency traffic.
+3. Move the element into or out of the slot.
+4. One release store of the new index.
+
+The remote atomic is loaded only when the cached index says the ring might be full or empty. That load is an L3 hop on this die and is the tail contributor. `try_push_n` / `try_pop_n` construct or consume a prefix and publish once, so a burst pays for the index line once. The slot bytes themselves are true sharing (producer writes, consumer reads) and cannot be removed.
+
+`try_push` reserves the slot before it moves the source. A `false` return leaves the source intact. This is the bug to not reintroduce: a by-value push that moves before the full-check destroys the element on the failure path.
+
+### Failure modes
+
+| Condition | Result | What the caller does |
+| --- | --- | --- |
+| Full | `try_push` returns false, source unchanged | Stop ingesting. Do not drop the event. Do not block inside the ring |
+| Empty | `try_pop` returns false, destination unchanged | Park. Phase 1 parks on io_uring or epoll, not in the ring |
+| Bounded spin | `push_bounded(ring, value, pauses)` | `pauses` is the number of `pause` instructions, not an infinite retry. Budget 0 is one try. On false, stop reading the socket |
+| Second producer or second consumer | Debug builds abort. Release builds are a data race | One ring, one direction, two threads |
+| Destroy while a thread is inside | Undefined | Join both sides first. The destructor then destroys leftovers in order |
+| `size_approx()` | Exact only when quiescent. May exceed capacity under race | Metrics only. Never a push/pop decision |
+
+There is no futex, no allocation, and no drop. Backpressure is a `false` return in a handful of instructions. A stalled consumer becomes a full ring, which becomes a stopped socket read, which becomes TCP window pressure. An unbounded spin in front of a stalled consumer is a `p99.9` outage that looks like a busy CPU.
+
+## Arena and slab
+
+Both are core-local. Neither takes a lock.
+
+`Arena` is a bump pointer over one `mmap(MAP_PRIVATE|MAP_ANONYMOUS)` region, rounded up to the page size and write-prefaulted at construction. The first request must not take a minor fault; that fault is a tail spike. `reset()` rewinds the cursor and keeps the pages. `discard()` is the idle path (`MADV_DONTNEED`) and invalidates every pointer. `rewind(mark)` rolls back a request that failed mid-parse; a mark past `used()` is rejected and the cursor stays. `allocate` returns `nullptr` when the region is exhausted or the alignment is not a power of two. That `nullptr` is the same backpressure signal as a full ring.
+
+The arena does not run destructors. A `std::string` or anything else that owns a resource does not belong in it.
+
+`Slab` is a fixed-stride pool for objects that outlive one request (connection state). The stride is at least `sizeof(void*)` and a multiple of the caller's alignment, so a free block can hold an intrusive freelist link. Pass `kCacheLineBytes` (64) when two live objects must not share a line. Exhaustion returns `nullptr`. `deallocate(nullptr)` is a no-op. A pointer the slab did not hand out aborts in every build, because ignoring it corrupts the freelist. Debug builds also abort on double-free and on a second thread. A bad size or a failed `mmap` leaves `ok() == false` and prints the reason; that is startup failure, not a hot-path `nullptr`.
+
+`lock_pages()` is optional `mlock`. It fails closed when `RLIMIT_MEMLOCK` refuses, and the memory stays usable. It is not on by default.
+
+## In-process event
+
+`kestrel::Event` in `include/kestrel/event.hpp`. 32 bytes, 32-byte aligned, so it never straddles a 64-byte line. Two events per line. Trivially copyable. Numeric values are ABI.
+
+```
+offset  0  u64 conn_id          0 means unassigned
+offset  8  u32 arena_offset     0xFFFFFFFF (kNoArenaOffset) means no payload
+offset 12  u32 byte_length
+offset 16  u16 type             EventType, values below
+offset 18  u16 flags
+offset 20  u32 reserved
+```
+
+| EventType | Value |
+| --- | --- |
+| None | 0 |
+| Accept | 1 |
+| Readable | 2 |
+| Writable | 3 |
+| Close | 4 |
+| CacheLookup | 5 |
+| CacheHit | 6 |
+| CacheMiss | 7 |
+| UpstreamChunk | 8 |
+| Shutdown | 9 |
+
+Flags: bit 0 `kEventFlagBorrowed` (payload is not owned by this arena generation), bit 1 `kEventFlagEndOfStream`.
+
+`ReactorRing` is `SpscRing<Event, 512>`. 512 × 32 B = 16 KiB.
+
+## Who owns the bytes an Event names
+
+The arena is a generation, not a heap. Phase 1 follows these rules or it will read freed request bytes:
+
+- `mark()` is taken before a request is parsed. `rewind(mark)` is legal only when every Event carved from bytes past that mark is still unpublished, or has been dropped on this same thread before another thread observed it.
+- After `try_push` returns true, the producer does not `rewind` or `reset` across that `arena_offset` until the consumer has popped the Event and finished the `byte_length` bytes.
+- `reset()` is legal only when the ring is empty and no live Event names this arena.
+- `kEventFlagBorrowed` means the offset belongs to a longer-lived object (a connection buffer in the slab). Rewind does not release it, and the producer does not reuse it as scratch.
+- The consumer finishes or copies those bytes before it parks. It does not store the pointer into another core's arena.
+
+## Inter-node frame
+
+`include/kestrel/frame.hpp`. Little-endian, version 1, 32-byte header. The codec does not allocate and does not open a socket. The payload span returned by decode points into the caller's buffer.
+
+```
+offset  0  u32 magic           'KSTR' = 0x5254534B
+offset  4  u16 version         1
+offset  6  u16 flags           unknown bits are preserved, not rejected
+offset  8  u32 header_bytes    32
+offset 12  u32 payload_bytes
+offset 16  u32 crc32c          CRC-32C of (header with this field zero || payload)
+offset 20  u64 stream_id
+offset 28  u16 type            FrameType, values below
+offset 30  u16 reserved        encode writes 0; decode rejects non-zero
+```
+
+| FrameType | Value |
+| --- | --- |
+| Hello | 1 |
+| CacheEntry | 2 |
+| CacheInvalidate | 3 |
+| Ping | 4 |
+| PingAck | 5 |
+
+Unknown type values decode successfully. The codec is not a dispatcher.
+
+Partial I/O is a status, not a short read inside the function:
+
+| Status | When |
+| --- | --- |
+| NeedMore | Fewer than 32 bytes, or fewer than 32 + a legal `payload_bytes` |
+| BadMagic | 32 bytes present, magic is not `KSTR` |
+| BadVersion | version is not 1 |
+| BadLength | `header_bytes != 32`, `reserved != 0`, or `payload_bytes > 16 MiB` |
+| BadCrc | the bytes are all present and the checksum does not match |
+| Ok | header and payload checked |
+
+A declared payload above 16 MiB is `BadLength` even when the buffer is short. A hostile length must not make the caller wait for it. `encode_frame` writes nothing it will not finish: a short destination or a payload that overlaps the header region returns false with the destination unchanged. A payload that already sits at `dest + 32` is not copied.
+
+CRC-32C parameters: init `0xFFFFFFFF`, xorout `0xFFFFFFFF`, reflected polynomial `0x82F63B78`. Empty input is `0`. The check vector `"123456789"` is `0xE3069283`. On this CPU `crc32c()` uses `_mm_crc32_u64` / `u32` / `u16` / `u8`. `crc32c_software()` is the reference and the fallback when SSE4.2 is absent; the tests require them to agree.
+
+## What phase 0 deliberately does not do
+
+- No `io_uring`, no `epoll`, no HTTP parser. The ring's `false` return is the hook those will block on.
+- No HNSW and no SIMD distance kernel. AVX2 is the compile target so Phase 1 can use 256-bit loads without a second ISA.
+- No WAL. The frame CRC is the checksum the WAL will reuse.
+- No hugepages. This kernel has none configured, and a failed `MAP_HUGETLB` is the wrong startup surprise.
