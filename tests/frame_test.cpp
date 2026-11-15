@@ -154,6 +154,19 @@ void test_inplace_payload() {
   CHECK(decoded.payload[2] == std::byte{0x30});
 }
 
+void test_type_numbers() {
+  CHECK(static_cast<unsigned>(kestrel::FrameType::Hello) == 1u);
+  CHECK(static_cast<unsigned>(kestrel::FrameType::CacheEntry) == 2u);
+  CHECK(static_cast<unsigned>(kestrel::FrameType::CacheInvalidate) == 3u);
+  CHECK(static_cast<unsigned>(kestrel::FrameType::Ping) == 4u);
+  CHECK(static_cast<unsigned>(kestrel::FrameType::PingAck) == 5u);
+  CHECK(static_cast<unsigned>(kestrel::FrameType::PingReq) == 6u);
+  CHECK(static_cast<unsigned>(kestrel::FrameType::Member) == 7u);
+  CHECK(static_cast<unsigned>(kestrel::FrameType::Fetch) == 8u);
+  CHECK(static_cast<unsigned>(kestrel::FrameType::FetchMiss) == 9u);
+  CHECK(static_cast<unsigned>(kestrel::FrameType::FetchFail) == 10u);
+}
+
 }  // namespace
 
 int main() {
@@ -161,6 +174,7 @@ int main() {
   test_roundtrip();
   test_partial_and_reject();
   test_inplace_payload();
+  test_type_numbers();
   const int failed = kestrel::test::failures.load();
   if (failed == 0) {
     std::puts("frame_test ok");

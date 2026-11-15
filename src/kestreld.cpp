@@ -20,7 +20,8 @@ void on_signal(int) noexcept { g_stop.store(1, std::memory_order_release); }
 void usage() noexcept {
   std::fputs(
       "usage: kestreld [--bind ADDR] [--port N] [--cores N] [--dim N]\n"
-      "                [--threshold F] [--wal DIR] [--upstream ADDR:PORT] [--epoll]\n",
+      "                [--threshold F] [--wal DIR] [--upstream ADDR:PORT]\n"
+      "                [--peer-port N] [--advertise ADDR] [--peers ADDR:PORT,...] [--epoll]\n",
       stderr);
 }
 
@@ -123,6 +124,17 @@ int main(int argc, char** argv) {
       }
     } else if (std::strcmp(arg, "--epoll") == 0) {
       config.force_epoll = true;
+    } else if (std::strcmp(arg, "--peer-port") == 0) {
+      if (!parse_u16(need("--peer-port"), config.peer_port) || config.peer_port == 0) {
+        std::fputs("kestrel: --peer-port is not a port\n", stderr);
+        return 2;
+      }
+      config.cluster = true;
+    } else if (std::strcmp(arg, "--advertise") == 0) {
+      config.advertise_host = need("--advertise");
+    } else if (std::strcmp(arg, "--peers") == 0) {
+      config.peers = need("--peers");
+      config.cluster = true;
     } else if (std::strcmp(arg, "--help") == 0) {
       usage();
       return 0;
@@ -131,6 +143,15 @@ int main(int argc, char** argv) {
       usage();
       return 2;
     }
+  }
+
+  if (config.peers != nullptr && !config.cluster) {
+    std::fputs("kestrel: --peers needs --peer-port\n", stderr);
+    return 2;
+  }
+  if (config.cluster && config.peer_port == 0) {
+    std::fputs("kestrel: --peer-port is required\n", stderr);
+    return 2;
   }
 
   kestrel::Server server(config);

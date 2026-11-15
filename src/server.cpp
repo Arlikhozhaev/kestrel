@@ -4,10 +4,17 @@
 
 #include "kestrel/server.hpp"
 
+#include "kestrel/circuit.hpp"
+#include "kestrel/cluster_wire.hpp"
+#include "kestrel/core_mail.hpp"
 #include "kestrel/cpu.hpp"
 #include "kestrel/feature_hash.hpp"
+#include "kestrel/frame.hpp"
+#include "kestrel/hash_ring.hpp"
 #include "kestrel/hnsw.hpp"
 #include "kestrel/http.hpp"
+#include "kestrel/simd.hpp"
+#include "kestrel/swim.hpp"
 #include "kestrel/wal.hpp"
 
 #include <atomic>
@@ -25,6 +32,7 @@
 #include <netinet/tcp.h>
 #include <signal.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -40,18 +48,27 @@ struct Server::Impl {
   char bind_host[64]{};
   char wal_dir[256]{};
   char upstream_host[64]{};
+  char advertise_host[64]{};
+  char peers_text[1200]{};
   sockaddr_in upstream_addr{};
   int listen_fds[64]{};
+  int wake_fd[64]{};
   int cpus[64]{};
   int core_count = 0;
   int thread_count = 0;
   std::uint16_t port = 0;
+  std::uint16_t peer_port = 0;
+  std::uint32_t self_addr = 0;
+  int peer_listen = -1;
   bool use_uring = false;
   bool started = false;
   std::atomic<bool> stop{false};
   std::atomic<bool> failed{false};
   std::atomic<bool> fell_back{false};
   std::atomic<int> ready{0};
+  std::atomic<int> members{0};
+  CoreMail* mail = nullptr;
+  void* cluster_node = nullptr;
   std::thread threads[64];
 };
 
@@ -68,19 +85,40 @@ constexpr int kAcceptBurst = 32;
 struct Conn;
 
 struct Op {
-  enum Kind : std::uint8_t { Accept, Recv, Send, Connect, UpRecv, UpSend };
+  enum Kind : std::uint8_t {
+    Accept,
+    Recv,
+    Send,
+    Connect,
+    UpRecv,
+    UpSend,
+    PeerAccept,
+    PeerRecv,
+    PeerSend,
+    PeerConnect,
+    Wake
+  };
   Kind kind = Accept;
   Conn* conn = nullptr;
+  std::uint16_t slot = 0;
 };
+
+constexpr std::uint8_t kWatchConn = 0;
+constexpr std::uint8_t kWatchListen = 1;
+constexpr std::uint8_t kWatchWake = 2;
+constexpr std::uint8_t kWatchPeerListen = 3;
+constexpr std::uint8_t kWatchPeer = 4;
 
 struct Watch {
   Conn* conn = nullptr;
   bool upstream = false;
   bool registered = false;
   std::uint32_t events = 0;
+  std::uint8_t kind = kWatchConn;
+  std::uint16_t slot = 0;
 };
 
-enum class Phase : std::uint8_t { Free, Read, Write, Connect, ProxySend, Proxy };
+enum class Phase : std::uint8_t { Free, Read, Write, Connect, ProxySend, Proxy, AwaitCluster };
 
 struct Conn {
   int fd = -1;
@@ -100,6 +138,7 @@ struct Conn {
   bool up_recv_on = false;
   bool up_send_on = false;
   bool connect_on = false;
+  bool internal = false;
   int status = 0;
   int inflight = 0;
   int next_free = -1;
@@ -119,6 +158,8 @@ struct Conn {
   std::uint8_t chunk_state = 0;
   std::uint8_t size_len = 0;
   std::uint8_t trailer_run = 0;
+  std::uint64_t key = 0;
+  std::uint32_t epoch = 0;
   sockaddr_in up_addr{};
   Op recv_op{};
   Op send_op{};
@@ -139,6 +180,22 @@ struct Conn {
 
 struct Core;
 
+void pump_read(Core& core, Conn& conn);
+
+[[nodiscard]] std::uint64_t mono_ms() noexcept;
+[[nodiscard]] bool store_record(Core& core, std::span<const float> vector, std::string_view text,
+                               std::string_view response, bool broadcast) noexcept;
+void cluster_note_stored(Core& core, std::span<const float> vector, std::string_view text,
+                         std::string_view response) noexcept;
+void cluster_fill_failed(Core& core, Conn& conn) noexcept;
+[[nodiscard]] bool cluster_continue_miss(Core& core, Conn& conn);
+void cluster_setup(Core& core) noexcept;
+void cluster_on_loop(Core& core) noexcept;
+void cluster_shutdown(Core& core) noexcept;
+void peer_epoll(Core& core, Watch* watch, std::uint32_t events) noexcept;
+void cluster_drive_uring(Core& core) noexcept;
+void cluster_on_cqe(Core& core, Op* op, int res) noexcept;
+
 void recycle(Core& core, Conn& conn);
 void rearm(Core& core, Conn& conn);
 void pump_read(Core& core, Conn& conn);
@@ -157,8 +214,10 @@ struct Core {
   HnswIndex index;
   Wal wal;
   FeatureHashEmbedder embed;
+  Circuit upstream_circuit;
   Conn* conns = nullptr;
   Watch listen_watch{};
+  Watch wake_watch{};
   Op accept_op{};
   sockaddr_storage accept_addr{};
   socklen_t accept_len = 0;
@@ -288,6 +347,7 @@ void disarm(Core& core, Conn& conn) noexcept {
 }
 
 void recycle(Core& core, Conn& conn) {
+  disarm(core, conn);
   if (conn.fd >= 0) {
     ::close(conn.fd);
     conn.fd = -1;
@@ -296,7 +356,6 @@ void recycle(Core& core, Conn& conn) {
     ::close(conn.upstream);
     conn.upstream = -1;
   }
-  disarm(core, conn);
   conn.phase = Phase::Free;
   conn.keep_alive = false;
   conn.client_stream = false;
@@ -312,6 +371,8 @@ void recycle(Core& core, Conn& conn) {
   conn.up_recv_on = false;
   conn.up_send_on = false;
   conn.connect_on = false;
+  conn.internal = false;
+  conn.key = 0;
   conn.status = 0;
   conn.content_length = -1;
   conn.body_got = 0;
@@ -340,6 +401,7 @@ void close_conn(Core& core, Conn& conn) {
   }
   conn.closing = true;
   conn.phase = Phase::Free;
+  disarm(core, conn);
   if (conn.fd >= 0) {
     ::close(conn.fd);
     conn.fd = -1;
@@ -348,7 +410,6 @@ void close_conn(Core& core, Conn& conn) {
     ::close(conn.upstream);
     conn.upstream = -1;
   }
-  disarm(core, conn);
   if (conn.inflight == 0) {
     recycle(core, conn);
   }
@@ -363,6 +424,7 @@ void close_conn(Core& core, Conn& conn) {
   conn.next_free = -1;
   conn.phase = Phase::Read;
   conn.closing = false;
+  ++conn.epoch;
   return &conn;
 }
 
@@ -411,20 +473,32 @@ void remember(Core& core, Conn& conn) noexcept {
   if (!core.embed.embed(std::string_view(conn.prompt, conn.prompt_len), std::span<float>(vec, dim))) {
     return;
   }
-  const std::uint64_t offset = core.wal.append(std::span<const float>(vec, dim),
-                                              std::string_view(conn.prompt, conn.prompt_len),
-                                              std::string_view(text, text_len));
-  if (offset == UINT64_MAX) {
+  if (!store_record(core, std::span<const float>(vec, dim), std::string_view(conn.prompt, conn.prompt_len),
+                    std::string_view(text, text_len), true)) {
     return;
   }
-  (void)core.index.insert(std::span<const float>(vec, dim), offset);
+  cluster_note_stored(core, std::span<const float>(vec, dim), std::string_view(conn.prompt, conn.prompt_len),
+                      std::string_view(text, text_len));
 }
 
 void finish_upstream(Core& core, Conn& conn) {
+  const bool stored = conn.status == 200 && !conn.broken;
+  if (stored) {
+    core.upstream_circuit.succeed();
+  } else if (conn.upstream >= 0 || conn.broken) {
+    core.upstream_circuit.fail(mono_ms());
+  }
   remember(core, conn);
   if (conn.upstream >= 0) {
     ::close(conn.upstream);
     conn.upstream = -1;
+  }
+  if (conn.internal) {
+    if (!stored) {
+      cluster_fill_failed(core, conn);
+    }
+    recycle(core, conn);
+    return;
   }
   if (conn.broken || !conn.keep_alive) {
     close_conn(core, conn);
@@ -818,6 +892,12 @@ void fail_connect(Core& core, Conn& conn) {
     conn.upstream = -1;
   }
   conn.connect_on = false;
+  core.upstream_circuit.fail(mono_ms());
+  if (conn.internal) {
+    cluster_fill_failed(core, conn);
+    recycle(core, conn);
+    return;
+  }
   if (conn.out_len == conn.out_sent) {
     send_status(core, conn, 502, "upstream connect failed");
     rearm(core, conn);
@@ -900,6 +980,11 @@ void pump_read(Core& core, Conn& conn) {
     send_status(core, conn, 400, "malformed json");
     return;
   }
+  if (core.impl->config.cluster || (core.impl->mail != nullptr && core.id != 0)) {
+    if (!cluster_continue_miss(core, conn)) {
+      return;
+    }
+  }
   if (core.impl->config.upstream_port == 0) {
     send_status(core, conn, 502, "cache miss");
     return;
@@ -908,6 +993,15 @@ void pump_read(Core& core, Conn& conn) {
 }
 
 void begin_proxy(Core& core, Conn& conn) {
+  if (!core.upstream_circuit.allow(mono_ms())) {
+    if (conn.internal) {
+      cluster_fill_failed(core, conn);
+      recycle(core, conn);
+      return;
+    }
+    send_status(core, conn, 502, "upstream unavailable");
+    return;
+  }
   const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
   const bool socket_ok = fd >= 0 && set_nodelay(fd) &&
                          (core.ring_ready ? set_cloexec(fd) : set_nonblock_cloexec(fd));
@@ -1173,6 +1267,15 @@ void handle_epoll(Core& core, const epoll_event& event) {
   if (watch == nullptr) {
     return;
   }
+  if (watch->kind == kWatchWake) {
+    cluster_on_loop(core);
+    return;
+  }
+  if (watch->kind == kWatchPeerListen || watch->kind == kWatchPeer) {
+    cluster_on_loop(core);
+    peer_epoll(core, watch, event.events);
+    return;
+  }
   if (watch->conn == nullptr) {
     if (event.events & (EPOLLERR | EPOLLHUP)) {
       return;
@@ -1228,10 +1331,13 @@ void run_epoll(Core& core) {
     return;
   }
   core.listen_watch.conn = nullptr;
+  core.listen_watch.kind = kWatchListen;
   arm_listen(core);
+  cluster_setup(core);
   core.impl->ready.fetch_add(1, std::memory_order_release);
   epoll_event events[64];
   while (!core.impl->stop.load(std::memory_order_acquire)) {
+    cluster_on_loop(core);
     const int n = ::epoll_wait(core.ep, events, 64, 100);
     if (n < 0) {
       if (errno == EINTR) {
@@ -1243,6 +1349,7 @@ void run_epoll(Core& core) {
       handle_epoll(core, events[i]);
     }
   }
+  cluster_shutdown(core);
 }
 
 #ifdef KESTREL_HAS_LIBURING
@@ -1326,6 +1433,7 @@ void submit_conn(Core& core, Conn& conn) noexcept {
 
 void drive_uring(Core& core) noexcept {
   submit_accept(core);
+  cluster_drive_uring(core);
   for (std::uint32_t i = 0; i < core.conn_cap; ++i) {
     if (core.conns[i].phase != Phase::Free && !core.conns[i].closing) {
       submit_conn(core, core.conns[i]);
@@ -1345,6 +1453,11 @@ void on_cqe(Core& core, io_uring_cqe* cqe) {
     return;
   }
   const int res = cqe->res;
+  if (op->kind == Op::Wake || op->kind == Op::PeerAccept || op->kind == Op::PeerRecv || op->kind == Op::PeerSend ||
+      op->kind == Op::PeerConnect) {
+    cluster_on_cqe(core, op, res);
+    return;
+  }
   if (op->kind == Op::Accept) {
     core.accept_on = false;
     if (res >= 0) {
@@ -1422,8 +1535,10 @@ void run_uring(Core& core) {
   core.ring_ready = true;
   core.accept_op.kind = Op::Accept;
   core.accept_op.conn = nullptr;
+  cluster_setup(core);
   core.impl->ready.fetch_add(1, std::memory_order_release);
   while (!core.impl->stop.load(std::memory_order_acquire)) {
+    cluster_on_loop(core);
     drive_uring(core);
     io_uring_submit(&core.ring);
     io_uring_cqe* cqe = nullptr;
@@ -1447,6 +1562,7 @@ void run_uring(Core& core) {
       io_uring_cq_advance(&core.ring, done);
     }
   }
+  cluster_shutdown(core);
 }
 #endif
 
@@ -1541,6 +1657,8 @@ void core_main(Server::Impl* impl, int core_id) {
   run_epoll(core);
 }
 
+#include "server_cluster.inc"
+
 }  // namespace
 
 namespace {
@@ -1607,6 +1725,41 @@ namespace {
   return true;
 }
 
+[[nodiscard]] bool bind_peer(Server::Impl& impl) noexcept {
+  const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0 || !set_nonblock_cloexec(fd)) {
+    if (fd >= 0) {
+      ::close(fd);
+    }
+    return false;
+  }
+  const int one = 1;
+  if (::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0) {
+    ::close(fd);
+    return false;
+  }
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(impl.config.peer_port);
+  addr.sin_addr.s_addr = htonl(impl.self_addr);
+  if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || ::listen(fd, 128) != 0) {
+    std::fprintf(stderr, "kestrel: peer bind %s:%u failed: %s\n", impl.advertise_host,
+                 static_cast<unsigned>(impl.config.peer_port), std::strerror(errno));
+    ::close(fd);
+    return false;
+  }
+  sockaddr_in actual{};
+  socklen_t len = sizeof(actual);
+  if (::getsockname(fd, reinterpret_cast<sockaddr*>(&actual), &len) != 0) {
+    ::close(fd);
+    return false;
+  }
+  impl.peer_listen = fd;
+  impl.peer_port = ntohs(actual.sin_port);
+  impl.self_addr = ntohl(actual.sin_addr.s_addr);
+  return true;
+}
+
 }  // namespace
 
 Server::Server(const ServerConfig& config) : impl_(new (std::nothrow) Impl) {
@@ -1616,6 +1769,7 @@ Server::Server(const ServerConfig& config) : impl_(new (std::nothrow) Impl) {
   impl_->config = config;
   for (int i = 0; i < kMaxCores; ++i) {
     impl_->listen_fds[i] = -1;
+    impl_->wake_fd[i] = -1;
   }
   if (!copy_text(impl_->bind_host, sizeof(impl_->bind_host), config.bind_host) ||
       !copy_text(impl_->wal_dir, sizeof(impl_->wal_dir), config.wal_dir)) {
@@ -1631,6 +1785,25 @@ Server::Server(const ServerConfig& config) : impl_(new (std::nothrow) Impl) {
       impl_->upstream_addr.sin_family = AF_INET;
       impl_->upstream_addr.sin_port = htons(config.upstream_port);
       impl_->config.upstream_port = config.upstream_port;
+    }
+  }
+  if (config.cluster) {
+    const char* advertise = config.advertise_host;
+    if (advertise == nullptr || advertise[0] == '\0') {
+      advertise = std::strcmp(impl_->bind_host, "0.0.0.0") == 0 ? "127.0.0.1" : impl_->bind_host;
+    }
+    in_addr addr{};
+    if (!copy_text(impl_->advertise_host, sizeof(impl_->advertise_host), advertise) ||
+        ::inet_pton(AF_INET, impl_->advertise_host, &addr) != 1) {
+      std::fprintf(stderr, "kestrel: --advertise must be an IPv4 address\n");
+      impl_->failed.store(true, std::memory_order_relaxed);
+    } else {
+      impl_->self_addr = ntohl(addr.s_addr);
+    }
+    if (config.peers != nullptr && config.peers[0] != '\0' &&
+        !copy_text(impl_->peers_text, sizeof(impl_->peers_text), config.peers)) {
+      std::fprintf(stderr, "kestrel: --peers is too long\n");
+      impl_->failed.store(true, std::memory_order_relaxed);
     }
   }
 }
@@ -1684,6 +1857,24 @@ bool Server::start() {
     }
     return false;
   }
+  const auto release_sockets = [&]() noexcept {
+    if (impl_->peer_listen >= 0) {
+      ::close(impl_->peer_listen);
+      impl_->peer_listen = -1;
+    }
+    for (int i = 0; i < impl_->core_count; ++i) {
+      if (impl_->listen_fds[i] >= 0) {
+        ::close(impl_->listen_fds[i]);
+        impl_->listen_fds[i] = -1;
+      }
+      if (impl_->wake_fd[i] >= 0) {
+        ::close(impl_->wake_fd[i]);
+        impl_->wake_fd[i] = -1;
+      }
+    }
+    delete impl_->mail;
+    impl_->mail = nullptr;
+  };
   impl_->use_uring = false;
 #ifdef KESTREL_HAS_LIBURING
   if (!impl_->config.force_epoll) {
@@ -1700,6 +1891,32 @@ bool Server::start() {
     for (int i = 0; i < impl_->core_count; ++i) {
       if (!clear_nonblock(impl_->listen_fds[i])) {
         std::fprintf(stderr, "kestrel: listen socket stayed non-blocking\n");
+      }
+    }
+  }
+  if (impl_->config.cluster && !bind_peer(*impl_)) {
+    release_sockets();
+    return false;
+  }
+  if (impl_->use_uring && impl_->peer_listen >= 0) {
+    if (!clear_nonblock(impl_->peer_listen)) {
+      std::fprintf(stderr, "kestrel: peer socket stayed non-blocking\n");
+    }
+  }
+  if (impl_->core_count > 1) {
+    const auto dim = static_cast<std::uint32_t>(padded_dimension(impl_->config.dimension));
+    impl_->mail = new (std::nothrow) CoreMail(static_cast<std::uint32_t>(impl_->core_count), dim);
+    if (impl_->mail == nullptr || !impl_->mail->ok()) {
+      std::fprintf(stderr, "kestrel: core mail failed\n");
+      release_sockets();
+      return false;
+    }
+    for (int i = 0; i < impl_->core_count; ++i) {
+      impl_->wake_fd[i] = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+      if (impl_->wake_fd[i] < 0) {
+        std::fprintf(stderr, "kestrel: eventfd failed: %s\n", std::strerror(errno));
+        release_sockets();
+        return false;
       }
     }
   }
@@ -1734,13 +1951,35 @@ void Server::stop() noexcept {
   }
   impl_->thread_count = 0;
   impl_->started = false;
+  if (impl_->peer_listen >= 0) {
+    ::close(impl_->peer_listen);
+    impl_->peer_listen = -1;
+  }
+  delete impl_->mail;
+  impl_->mail = nullptr;
   for (int i = 0; i < kMaxCores; ++i) {
+    if (impl_->wake_fd[i] >= 0) {
+      ::close(impl_->wake_fd[i]);
+      impl_->wake_fd[i] = -1;
+    }
     impl_->listen_fds[i] = -1;
   }
 }
 
 std::uint16_t Server::port() const noexcept {
   return impl_ == nullptr ? 0 : impl_->port;
+}
+
+std::uint16_t Server::peer_port() const noexcept {
+  return impl_ == nullptr ? 0 : impl_->peer_port;
+}
+
+int Server::members() const noexcept {
+  if (impl_ == nullptr) {
+    return 0;
+  }
+  const int n = impl_->members.load(std::memory_order_acquire);
+  return n == 0 ? (impl_->config.cluster ? 1 : 0) : n;
 }
 
 const char* Server::poller_name() const noexcept {

@@ -1,6 +1,6 @@
 # Kestrel phase 0 architecture
 
-Phase 0 freezes the memory layout and the two wire images the rest of the system is built on. Phase 1 is the single-node engine on top of those layouts: one reactor thread per physical core, an HNSW index, and a WAL. The layouts below do not move.
+Phase 0 freezes the memory layout and the two wire images the rest of the system is built on. Phase 1 is the single-node engine on top of those layouts: one reactor thread per physical core, an HNSW index, and a WAL. Phase 2 adds hashed owners, SWIM, and a local copy after the first fetch. The layouts below do not move.
 
 Host this was measured on, and that the defaults match:
 
@@ -12,7 +12,7 @@ Host this was measured on, and that the defaults match:
 | Caches | L1d 32 KiB 8-way, L2 256 KiB, L3 8 MiB, coherency line 64 B |
 | SIMD | AVX2, FMA, BMI1/2, SSE4.2. No AVX-512. `-march=native` does not emit AVX-512 |
 | Pages | 4096 B. `HugePages_Total` is 0, so the allocators do not request huge pages |
-| Toolchain | g++ 13.3.0, CMake, liburing 2.5 installed and not linked |
+| Toolchain | g++ 13.3.0, CMake, liburing 2.5 linked when pkg-config finds it |
 | Kernel | 6.6.87 WSL2. `io_uring` symbols are in the kernel image; Phase 1 still has to probe `io_uring_queue_init` and fall back to epoll |
 
 Guest `pthread_setaffinity_np` works here. The hypervisor can still move the VM's vCPUs, so a latency number taken on this box is a development number, not the launch `p99.9` record.
@@ -147,6 +147,11 @@ offset 30  u16 reserved        encode writes 0; decode rejects non-zero
 | CacheInvalidate | 3 |
 | Ping | 4 |
 | PingAck | 5 |
+| PingReq | 6 |
+| Member | 7 |
+| Fetch | 8 |
+| FetchMiss | 9 |
+| FetchFail | 10 |
 
 Unknown type values decode successfully. The codec is not a dispatcher.
 
@@ -175,7 +180,7 @@ Phase 0 shipped none of the following. Phase 1 added the first three. Hugepages 
 
 ## Phase 1 single-node engine
 
-Each core binds the same port with `SO_REUSEPORT`, pins itself to `reactor_cpus[i]`, and owns a private HNSW plus `wal_dir/core-N.wal`. A hit on core 0 is invisible to core 1. That split is the Phase 2 replication problem. The default is one core, so one process has one cache. Port 0 is resolved by the first socket; the rest bind the port `getsockname` returned.
+Each core binds the same port with `SO_REUSEPORT`, pins itself to `reactor_cpus[i]`, and owns a private HNSW plus `wal_dir/core-N.wal`. A record this process stores is copied to its other cores. The hit path does not take that hop. The default is one core. Port 0 is resolved by the first socket; the rest bind the port `getsockname` returned.
 
 The poller is `io_uring` when `io_uring_queue_init` succeeds, otherwise level-triggered epoll. `--epoll` forces the fallback. io_uring sockets stay blocking: a non-blocking `recv` completes with `-EAGAIN` and the thread spins. epoll sockets are non-blocking and a ready fd is read until `EAGAIN`. One operation is in flight per direction. The completion already holds the bytes; the handler does not call `recv` again. Accept stops when the connection slab is empty and resumes when a connection is recycled. `SIGPIPE` is ignored and sends use `MSG_NOSIGNAL`.
 
@@ -188,3 +193,21 @@ HNSW is single-writer and has no lock. Dimension is padded up to a multiple of 8
 A WAL record is a version-1 frame with type `CacheEntry`. The payload is little-endian `u32 dimension`, `u32 text_len`, `u32 response_len`, `f32 vector[dimension]`, then the text and the response bytes. `recover` replays every good record. `NeedMore`, `BadCrc`, `BadMagic`, `BadLength`, and `BadVersion` truncate the tail to the last good offset and stop. A record whose dimension does not match the index is skipped and logged. Views returned by `read` point into the mapping and die at the next grow (`mremap` may move it) and at destruction.
 
 Client HTTP is Content-Length only. Chunked transfer is `Bad`: the clients this gateway is built for send a length, and a chunked body is not one buffer. `POST`/`PUT`/`PATCH` without a length is `Bad`. A message that cannot fit in the 64 KiB connection buffer is `TooLarge` and the server answers 413. Views point into that buffer. "Zero-copy" here means the parser does not allocate a string for the request. `recv` still copies out of the kernel; this is not registered-buffer DMA. A cache hit is a finite JSON or SSE body with `Content-Length`, so keep-alive does not depend on closing the socket. Upstream chunked responses are forwarded raw and de-chunked only into the cache scratch. The scratch is capped; past that the response is still forwarded and is not cached.
+
+## Phase 2 owners and a local copy
+
+A process is a SWIM member. Cores are not. Membership is a static `--peers` list of `IPv4:PORT`. There is no multicast. The peer port is not the HTTP port. Both sides send Hello and then use the address in that Hello, so both rings name the same endpoint. TCP close drops the socket and fails that peer's circuit. It does not mark the member dead. SWIM does, if the process stays gone.
+
+The key is FNV-1a of the exact prompt bytes, not the feature-hash vector. 128 vnodes per member, at most 32 members. `owners` returns `min(2, member count)` distinct members, walking from the first vnode at or after the key. Dead members leave the ring. Suspected members stay.
+
+The primary owner is the only process that calls the model while it is usable. The secondary asks the primary first. If that peer is down or its circuit is open, the secondary fills. A non-owner fetches the primary, then the secondary, stores the answer, and the next identical prompt on that process is the Phase 1 hit path. A non-owner never calls the model. `FetchMiss` means ask the other owner. `FetchFail` means the fill failed. The client is answered before any peer has the record. A peer can miss until the push arrives. The process that stored the entry still `fdatasync`s it.
+
+Inside one process the copy rides an SPSC ring of buffer indices, capacity 2, with two payload buffers and an ack ring beside it. The body does not sit in the slot array. The ring is touched on a store and on a cross-core miss, not on a hit. A copy fetched from another process is broadcast to the local cores and is not pushed back to the owner it came from.
+
+`CacheEntry` on the peer wire uses `stream_id` 0 for a replica push and a non-zero id for the fetch it answers. The payload is the WAL body. Types 6 through 10 were appended. They are not renumbered.
+
+The circuit breaker is per upstream, on each core, and per peer, on core 0. Five failures open it for 1000 ms. Half-open allows one trial. `allow` consumes that trial.
+
+Cluster defaults off, so a single process behaves as Phase 1. `--peer-port` turns it on and the CLI rejects port 0. `--peers` without `--peer-port` is an error. One extra upstream fill is accepted when membership changes and the ring moves a key. There is no migration protocol.
+
+SWIM runs on core 0, one probe at a time: a direct ping, one indirect ping, then suspected, then dead. Period, timeout, and suspect are 200 ms, 200 ms, and 1000 ms. A higher incarnation wins. A Hello whose incarnation is at or below a dead member's is taken as one past that incarnation, so a restart is not stuck.

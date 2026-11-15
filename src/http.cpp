@@ -834,4 +834,25 @@ std::size_t write_chat_sse(std::string_view model, std::string_view content,
   return finish(out);
 }
 
+std::size_t write_upstream_request(std::string_view model, std::string_view prompt,
+                                  std::span<std::byte> dest) noexcept {
+  if (model.empty()) {
+    model = "kestrel";
+  }
+  const std::size_t json = std::strlen("{\"model\":\"") + escaped_len(model) +
+                           std::strlen("\",\"messages\":[{\"role\":\"user\",\"content\":\"") + escaped_len(prompt) +
+                           std::strlen("\"}]}");
+  Writer out;
+  out.dest = dest.data();
+  out.cap = dest.size();
+  out.add_sv("POST /v1/chat/completions HTTP/1.1\r\nHost: kestrel\r\nContent-Type: application/json\r\nContent-Length: ");
+  append_u32(out, static_cast<unsigned>(json));
+  out.add_sv("\r\nConnection: close\r\n\r\n{\"model\":\"");
+  append_json_string(out, model);
+  out.add_sv("\",\"messages\":[{\"role\":\"user\",\"content\":\"");
+  append_json_string(out, prompt);
+  out.add_sv("\"}]}");
+  return finish(out);
+}
+
 }  // namespace kestrel

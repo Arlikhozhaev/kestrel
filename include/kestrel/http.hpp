@@ -50,4 +50,9 @@ enum class ExtractStatus : std::uint8_t { Ok, Bad, Overflow };
 [[nodiscard]] std::size_t write_chat_sse(std::string_view model, std::string_view content,
                                          std::span<std::byte> dest) noexcept;
 
+// POST /v1/chat/completions the owner sends when it fills for another process.
+// The client connection stays on the process that accepted it.
+[[nodiscard]] std::size_t write_upstream_request(std::string_view model, std::string_view prompt,
+                                                std::span<std::byte> dest) noexcept;
+
 }  // namespace kestrel

@@ -7,8 +7,10 @@ namespace kestrel {
 
 // One process, N cores. Each core binds the same port with SO_REUSEPORT,
 // pins itself to its own physical core, and owns a private HNSW plus WAL.
-// A hit on core 0 is invisible to core 1. That split is the Phase 2
-// replication problem. The default is one core, so a single node has one cache.
+// A record stored on this process is copied to the other cores over SPSC.
+// The hit path does not take that hop. Cluster mode is off unless configured:
+// two hashed owners store the entry, and any other process asks an owner
+// once, keeps the copy, and then hits locally. Only an owner calls the model.
 //
 // The hit path is: parse in place, feature-hash the prompt, HNSW search,
 // write the cached text. It does not allocate and it does not sync the WAL.
@@ -27,6 +29,12 @@ struct ServerConfig {
   bool force_epoll = false;
   std::uint32_t max_nodes = 10000;
   std::uint32_t max_connections = 128;
+  // Cluster is off unless set. peer_port 0 with cluster asks the kernel for a port.
+  // Cores inside the process still replicate over SPSC when there is more than one.
+  bool cluster = false;
+  std::uint16_t peer_port = 0;
+  const char* advertise_host = nullptr;
+  const char* peers = nullptr;
 };
 
 class Server {
@@ -40,6 +48,8 @@ class Server {
   void stop() noexcept;
 
   [[nodiscard]] std::uint16_t port() const noexcept;
+  [[nodiscard]] std::uint16_t peer_port() const noexcept;
+  [[nodiscard]] int members() const noexcept;
   [[nodiscard]] const char* poller_name() const noexcept;
 
   // Defined in server.cpp. Public so the reactor can name it; the type is

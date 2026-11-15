@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(kestrel VERSION 0.2.0 LANGUAGES CXX)
+project(kestrel VERSION 0.3.0 LANGUAGES CXX)
 
 # Phase 0 host this file was brought up on:
 #   Intel Core i7-8650U, 4 physical cores / 8 logical, SMT pairs (0,1) (2,3) (4,5) (6,7)
@@ -49,6 +49,9 @@ add_library(kestrel_core STATIC
   src/feature_hash.cpp
   src/http.cpp
   src/server.cpp
+  src/hash_ring.cpp
+  src/swim.cpp
+  src/core_mail.cpp
 )
 target_include_directories(kestrel_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(kestrel_core PUBLIC cxx_std_20)
@@ -146,3 +149,7 @@ kestrel_test(hnsw_test tests/hnsw_test.cpp)
 kestrel_test(wal_test tests/wal_test.cpp)
 kestrel_test(http_test tests/http_test.cpp)
 kestrel_test(server_test tests/server_test.cpp)
+kestrel_test(circuit_test tests/circuit_test.cpp)
+kestrel_test(hash_ring_test tests/hash_ring_test.cpp)
+kestrel_test(swim_test tests/swim_test.cpp)
+kestrel_test(cluster_test tests/cluster_test.cpp)

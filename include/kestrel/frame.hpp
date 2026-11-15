@@ -43,6 +43,11 @@ enum class FrameType : std::uint16_t {
   CacheInvalidate = 3,
   Ping = 4,
   PingAck = 5,
+  PingReq = 6,
+  Member = 7,
+  Fetch = 8,
+  FetchMiss = 9,
+  FetchFail = 10,
 };
 
 enum class DecodeStatus : std::uint8_t {

@@ -3,9 +3,11 @@
 C++20 self-hosted semantic cache and OpenAI-compatible inference gateway.
 Shared-nothing cores, no external database, no third-party proxy.
 
-**Status: Phase 1 of 4.** One process binds a port, serves an identical prompt
-from the on-core cache, and proxies a miss to an IPv4 model server. The
-embedder is a feature hash, not a model: paraphrases do not hit. This tree
+**Status: Phase 2 of 4.** One process serves an identical prompt from the on-core
+cache and proxies a miss to an IPv4 model server. With `--peer-port` and
+`--peers`, two hashed owners store each entry. Any other process asks an owner
+once, keeps the copy, and then hits locally. Only an owner calls the model.
+The embedder is a feature hash, not a model: paraphrases do not hit. This tree
 publishes no latency numbers.
 
 ## Start here
@@ -26,6 +28,7 @@ publishes no latency numbers.
 - Reactor pin set: one logical CPU per physical core, read from sysfs. On the development host (i7-8650U) that is `0, 2, 4, 6`.
 - One reactor thread per core (`io_uring`, or level-triggered epoll). Each core has its own HNSW and `core-N.wal`. A hit does not sync the log.
 - OpenAI-compatible `POST /v1/chat/completions` over HTTP/1.1. Cache hits are a finite JSON or SSE body with `Content-Length`.
+- Optional cluster: consistent hash, SWIM, async replication to two owners, and a local copy after the first fetch. Off unless `--peer-port` is set.
 
 ## What is not in this tree
 
@@ -33,7 +36,7 @@ publishes no latency numbers.
 | --- | --- | --- |
 | 0 | Ring, arena, slab, event, frame | this tree |
 | 1 | `io_uring` or epoll, HTTP/SSE, HNSW, WAL | this tree |
-| 2 | Consistent hashing, SWIM, replication, circuit breaker | not started |
+| 2 | Consistent hashing, SWIM, replication, circuit breaker | this tree |
 | 3 | HDR histograms, traces, chaos UI | not started |
 | 4 | `wrk2`/`k6` numbers, Distroless image | not started |
 
@@ -67,4 +70,4 @@ GitHub Actions (`.github/workflows/ci.yml`) runs the same three builds on Ubuntu
 ./build/release/kestreld --bind 127.0.0.1 --port 8080 --wal /tmp/kestrel-wal --upstream 127.0.0.1:8000
 ```
 
-`--epoll` forces the epoll reactor. `--upstream` is `IPv4:PORT`. A miss with no upstream is a 502. `--help` prints the flags. Unknown flags exit 2.
+`--epoll` forces the epoll reactor. `--upstream` is `IPv4:PORT`. A miss with no upstream is a 502. `--peer-port` turns the cluster on. `--peers` is `IPv4:PORT,IPv4:PORT` and requires `--peer-port`. `--advertise` is the IPv4 address other processes put in their peer list. `--help` prints the flags. Unknown flags exit 2.
