@@ -193,8 +193,10 @@ void cluster_setup(Core& core) noexcept;
 void cluster_on_loop(Core& core) noexcept;
 void cluster_shutdown(Core& core) noexcept;
 void peer_epoll(Core& core, Watch* watch, std::uint32_t events) noexcept;
+#ifdef KESTREL_HAS_LIBURING
 void cluster_drive_uring(Core& core) noexcept;
 void cluster_on_cqe(Core& core, Op* op, int res) noexcept;
+#endif
 
 void recycle(Core& core, Conn& conn);
 void rearm(Core& core, Conn& conn);

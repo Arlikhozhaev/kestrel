@@ -1335,8 +1335,8 @@ void cluster_shutdown(Core& core) noexcept {
   core.impl->cluster_node = nullptr;
 }
 
-void cluster_drive_uring(Core& core) noexcept {
 #ifdef KESTREL_HAS_LIBURING
+void cluster_drive_uring(Core& core) noexcept {
   Cluster* cluster = cluster_of(core.impl);
   if (!core.ring_ready || cluster == nullptr || core.id != 0) {
     return;
@@ -1395,9 +1395,6 @@ void cluster_drive_uring(Core& core) noexcept {
       }
     }
   }
-#else
-  (void)core;
-#endif
 }
 
 void cluster_on_cqe(Core& core, Op* op, int res) noexcept {
@@ -1457,3 +1454,4 @@ void cluster_on_cqe(Core& core, Op* op, int res) noexcept {
     }
   }
 }
+#endif
