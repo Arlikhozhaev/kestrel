@@ -91,7 +91,9 @@ void relax() noexcept {
         kinds[kind].counts[i] = src.counts[kind][i].load(std::memory_order_relaxed);
       }
     }
-    if (seq == src.seq.load(std::memory_order_acquire)) {
+    // Acquire fence so the payload loads cannot sink under the check.
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (seq == src.seq.load(std::memory_order_relaxed)) {
       return true;
     }
   }
@@ -151,7 +153,11 @@ void publish_stats(CoreStats& src, Published& dst) noexcept {
     return;
   }
   const std::uint64_t seq = dst.seq.load(std::memory_order_relaxed);
-  dst.seq.store(seq + 1, std::memory_order_release);
+  dst.seq.store(seq + 1, std::memory_order_relaxed);
+  // The odd store is relaxed. This fence keeps it from sinking into the
+  // payload and keeps the payload from rising in front of it. The even
+  // store is the release that publishes the payload.
+  std::atomic_thread_fence(std::memory_order_acq_rel);
   for (int kind = 0; kind < kObserveKinds; ++kind) {
     dst.total[kind].store(src.hdr[kind].total, std::memory_order_relaxed);
     dst.sum_us[kind].store(src.hdr[kind].sum_us, std::memory_order_relaxed);
@@ -212,7 +218,8 @@ std::size_t write_debug(const Published* slots, int cores, bool drop_upstream, b
       for (int i = 0; i < kTraceSlots; ++i) {
         trace[i] = slots[core].trace[i].load(std::memory_order_relaxed);
       }
-      loaded = seq == slots[core].seq.load(std::memory_order_acquire);
+      std::atomic_thread_fence(std::memory_order_acquire);
+      loaded = seq == slots[core].seq.load(std::memory_order_relaxed);
     }
     if (!loaded) {
       continue;

@@ -42,7 +42,9 @@ struct CoreStats {
   }
 };
 
-// Published copy. The owner writes it under `seq`. A scrape retries while `seq` is odd.
+// Published copy. The owner marks `seq` odd, fences, writes the counters,
+// then release-stores the even sequence. A scrape copies only under an even
+// sequence and checks it again after an acquire fence.
 struct Published {
   std::atomic<std::uint64_t> seq{0};
   std::atomic<std::uint64_t> total[kObserveKinds]{};
