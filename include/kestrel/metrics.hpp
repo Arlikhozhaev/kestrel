@@ -42,9 +42,9 @@ struct CoreStats {
   }
 };
 
-// Published copy. The owner marks `seq` odd, fences, writes the counters,
-// then release-stores the even sequence. A scrape copies only under an even
-// sequence and checks it again after an acquire fence.
+// Published copy. The owner acq_rel-increments `seq` to odd, writes the
+// counters, then release-increments to even. A scrape copies only under an
+// even sequence and checks it again after an acq_rel update of its own.
 struct Published {
   std::atomic<std::uint64_t> seq{0};
   std::atomic<std::uint64_t> total[kObserveKinds]{};

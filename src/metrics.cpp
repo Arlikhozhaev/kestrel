@@ -56,6 +56,15 @@ struct Out {
   }
 };
 
+// GCC rejects atomic_thread_fence under -fsanitize=thread. An acq_rel update of a
+// private atomic is the same local order: earlier loads stay above it, and the
+// sequence check stays below it.
+[[nodiscard]] bool same_seq(const Published& src, std::uint64_t seq) noexcept {
+  std::atomic<std::uint8_t> order{0};
+  order.fetch_add(0, std::memory_order_acq_rel);
+  return seq == src.seq.load(std::memory_order_relaxed);
+}
+
 void relax() noexcept {
 #if defined(__x86_64__) || defined(__i386__)
   asm volatile("pause" ::: "memory");
@@ -91,9 +100,7 @@ void relax() noexcept {
         kinds[kind].counts[i] = src.counts[kind][i].load(std::memory_order_relaxed);
       }
     }
-    // Acquire fence so the payload loads cannot sink under the check.
-    std::atomic_thread_fence(std::memory_order_acquire);
-    if (seq == src.seq.load(std::memory_order_relaxed)) {
+    if (same_seq(src, seq)) {
       return true;
     }
   }
@@ -152,12 +159,9 @@ void publish_stats(CoreStats& src, Published& dst) noexcept {
   if (!src.dirty) {
     return;
   }
-  const std::uint64_t seq = dst.seq.load(std::memory_order_relaxed);
-  dst.seq.store(seq + 1, std::memory_order_relaxed);
-  // The odd store is relaxed. This fence keeps it from sinking into the
-  // payload and keeps the payload from rising in front of it. The even
-  // store is the release that publishes the payload.
-  std::atomic_thread_fence(std::memory_order_acq_rel);
+  // Odd value: a scrape will retry. acq_rel keeps the payload stores below
+  // this update. The release increment publishes them with the even value.
+  dst.seq.fetch_add(1, std::memory_order_acq_rel);
   for (int kind = 0; kind < kObserveKinds; ++kind) {
     dst.total[kind].store(src.hdr[kind].total, std::memory_order_relaxed);
     dst.sum_us[kind].store(src.hdr[kind].sum_us, std::memory_order_relaxed);
@@ -168,7 +172,7 @@ void publish_stats(CoreStats& src, Published& dst) noexcept {
   for (int i = 0; i < kTraceSlots; ++i) {
     dst.trace[i].store(src.trace[i], std::memory_order_relaxed);
   }
-  dst.seq.store(seq + 2, std::memory_order_release);
+  dst.seq.fetch_add(1, std::memory_order_release);
   src.dirty = false;
 }
 
@@ -218,8 +222,7 @@ std::size_t write_debug(const Published* slots, int cores, bool drop_upstream, b
       for (int i = 0; i < kTraceSlots; ++i) {
         trace[i] = slots[core].trace[i].load(std::memory_order_relaxed);
       }
-      std::atomic_thread_fence(std::memory_order_acquire);
-      loaded = seq == slots[core].seq.load(std::memory_order_relaxed);
+      loaded = same_seq(slots[core], seq);
     }
     if (!loaded) {
       continue;
