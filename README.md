@@ -3,12 +3,13 @@
 C++20 self-hosted semantic cache and OpenAI-compatible inference gateway.
 Shared-nothing cores, no external database, no third-party proxy.
 
-**Status: Phase 2 of 4.** One process serves an identical prompt from the on-core
+**Status: Phase 3 of 4.** One process serves an identical prompt from the on-core
 cache and proxies a miss to an IPv4 model server. With `--peer-port` and
 `--peers`, two hashed owners store each entry. Any other process asks an owner
 once, keeps the copy, and then hits locally. Only an owner calls the model.
-The embedder is a feature hash, not a model: paraphrases do not hit. This tree
-publishes no latency numbers.
+`GET /metrics` is a Prometheus histogram. `--chaos` adds `GET /debug` and
+`POST /chaos`. The embedder is a feature hash, not a model: paraphrases do not
+hit. This tree publishes no latency numbers.
 
 ## Start here
 
@@ -29,6 +30,7 @@ publishes no latency numbers.
 - One reactor thread per core (`io_uring`, or level-triggered epoll). Each core has its own HNSW and `core-N.wal`. A hit does not sync the log.
 - OpenAI-compatible `POST /v1/chat/completions` over HTTP/1.1. Cache hits are a finite JSON or SSE body with `Content-Length`.
 - Optional cluster: consistent hash, SWIM, async replication to two owners, and a local copy after the first fetch. Off unless `--peer-port` is set.
+- Per-core HDR histogram, published once per reactor loop when it changed. `GET /metrics` merges a seqlock copy. `--chaos` serves a plain HTML page with four forms. A hit increments the private counter and does not publish.
 
 ## What is not in this tree
 
@@ -37,7 +39,7 @@ publishes no latency numbers.
 | 0 | Ring, arena, slab, event, frame | this tree |
 | 1 | `io_uring` or epoll, HTTP/SSE, HNSW, WAL | this tree |
 | 2 | Consistent hashing, SWIM, replication, circuit breaker | this tree |
-| 3 | HDR histograms, traces, chaos UI | not started |
+| 3 | HDR histograms, traces, chaos switch | this tree |
 | 4 | `wrk2`/`k6` numbers, Distroless image | not started |
 
 `kestrel-cli` is not written yet. `liburing` is linked when pkg-config finds it; otherwise the reactor uses epoll.

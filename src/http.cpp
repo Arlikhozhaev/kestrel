@@ -482,6 +482,8 @@ void append_json_string(Writer& w, std::string_view text) noexcept {
   switch (status) {
     case 400:
       return "Bad Request";
+    case 404:
+      return "Not Found";
     case 413:
       return "Payload Too Large";
     case 502:

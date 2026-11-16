@@ -13,6 +13,7 @@
 #include "kestrel/hash_ring.hpp"
 #include "kestrel/hnsw.hpp"
 #include "kestrel/http.hpp"
+#include "kestrel/metrics.hpp"
 #include "kestrel/simd.hpp"
 #include "kestrel/swim.hpp"
 #include "kestrel/wal.hpp"
@@ -69,6 +70,9 @@ struct Server::Impl {
   std::atomic<int> members{0};
   CoreMail* mail = nullptr;
   void* cluster_node = nullptr;
+  Published* published = nullptr;
+  std::atomic<std::uint32_t> chaos_drop_upstream{0};
+  std::atomic<std::uint32_t> chaos_drop_peers{0};
   std::thread threads[64];
 };
 
@@ -139,6 +143,7 @@ struct Conn {
   bool up_send_on = false;
   bool connect_on = false;
   bool internal = false;
+  bool observed = false;
   int status = 0;
   int inflight = 0;
   int next_free = -1;
@@ -159,6 +164,7 @@ struct Conn {
   std::uint8_t size_len = 0;
   std::uint8_t trailer_run = 0;
   std::uint64_t key = 0;
+  std::uint64_t start_us = 0;
   std::uint32_t epoch = 0;
   sockaddr_in up_addr{};
   Op recv_op{};
@@ -217,6 +223,8 @@ struct Core {
   Wal wal;
   FeatureHashEmbedder embed;
   Circuit upstream_circuit;
+  CoreStats stats;
+  Published* published = nullptr;
   Conn* conns = nullptr;
   Watch listen_watch{};
   Watch wake_watch{};
@@ -374,7 +382,9 @@ void recycle(Core& core, Conn& conn) {
   conn.up_send_on = false;
   conn.connect_on = false;
   conn.internal = false;
+  conn.observed = false;
   conn.key = 0;
+  conn.start_us = 0;
   conn.status = 0;
   conn.content_length = -1;
   conn.body_got = 0;
@@ -447,7 +457,17 @@ void queue_out(Conn& conn, std::size_t n, bool keep) noexcept {
   conn.request_total = 0;
 }
 
+void observe(Core& core, Conn& conn, ObserveKind kind) noexcept {
+  if (conn.internal || conn.observed || conn.start_us == 0) {
+    return;
+  }
+  conn.observed = true;
+  const std::uint64_t now = steady_us();
+  core.stats.record(kind, now > conn.start_us ? now - conn.start_us : 0);
+}
+
 void send_status(Core& core, Conn& conn, int status, const char* message) {
+  observe(core, conn, ObserveKind::Error);
   const std::size_t n = write_error(status, message, std::span<std::byte>(conn.outb, kBufBytes));
   if (n == 0) {
     close_conn(core, conn);
@@ -502,6 +522,7 @@ void finish_upstream(Core& core, Conn& conn) {
     recycle(core, conn);
     return;
   }
+  observe(core, conn, stored ? ObserveKind::Fill : ObserveKind::Error);
   if (conn.broken || !conn.keep_alive) {
     close_conn(core, conn);
     return;
@@ -927,6 +948,73 @@ void pump_read(Core& core, Conn& conn) {
   }
   conn.request_total = message.total;
   conn.keep_alive = message.keep_alive;
+  if (message.method == "GET" && message.target == "/metrics") {
+    char body[48 * 1024];
+    const std::size_t n = write_prometheus(core.impl->published, core.impl->core_count,
+                                          std::span<std::byte>(reinterpret_cast<std::byte*>(body), sizeof(body)));
+    char head[160];
+    const int h = std::snprintf(head, sizeof(head),
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\n"
+                                "Content-Length: %zu\r\nConnection: %s\r\n\r\n",
+                                n, conn.keep_alive ? "keep-alive" : "close");
+    if (n == 0 || h <= 0 || static_cast<std::size_t>(h) + n > kBufBytes) {
+      send_status(core, conn, 502, "metrics failed");
+      return;
+    }
+    std::memcpy(conn.outb, head, static_cast<std::size_t>(h));
+    std::memcpy(conn.outb + h, body, n);
+    queue_out(conn, static_cast<std::size_t>(h) + n, conn.keep_alive);
+    return;
+  }
+  if (message.method == "GET" && message.target == "/debug") {
+    if (!core.impl->config.chaos) {
+      send_status(core, conn, 404, "chaos is off");
+      return;
+    }
+    char body[56 * 1024];
+    const bool drop_up = core.impl->chaos_drop_upstream.load(std::memory_order_relaxed) != 0;
+    const bool drop_peers = core.impl->chaos_drop_peers.load(std::memory_order_relaxed) != 0;
+    const std::size_t n = write_debug(core.impl->published, core.impl->core_count, drop_up, drop_peers,
+                                      std::span<std::byte>(reinterpret_cast<std::byte*>(body), sizeof(body)));
+    char head[160];
+    const int h = std::snprintf(head, sizeof(head),
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
+                                "Content-Length: %zu\r\nConnection: close\r\n\r\n",
+                                n);
+    if (n == 0 || h <= 0 || static_cast<std::size_t>(h) + n > kBufBytes) {
+      send_status(core, conn, 502, "debug failed");
+      return;
+    }
+    std::memcpy(conn.outb, head, static_cast<std::size_t>(h));
+    std::memcpy(conn.outb + h, body, n);
+    queue_out(conn, static_cast<std::size_t>(h) + n, false);
+    return;
+  }
+  if (message.method == "POST" && message.target == "/chaos") {
+    if (!core.impl->config.chaos) {
+      send_status(core, conn, 404, "chaos is off");
+      return;
+    }
+    const std::string_view body = message.body;
+    if (body == "upstream=drop") {
+      core.impl->chaos_drop_upstream.store(1, std::memory_order_relaxed);
+    } else if (body == "upstream=ok") {
+      core.impl->chaos_drop_upstream.store(0, std::memory_order_relaxed);
+    } else if (body == "peers=drop") {
+      core.impl->chaos_drop_peers.store(1, std::memory_order_relaxed);
+    } else if (body == "peers=ok") {
+      core.impl->chaos_drop_peers.store(0, std::memory_order_relaxed);
+    } else {
+      send_status(core, conn, 400, "unknown chaos");
+      return;
+    }
+    const char* ok = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\n"
+                     "Connection: close\r\n\r\nok\n";
+    const std::size_t n = std::strlen(ok);
+    std::memcpy(conn.outb, ok, n);
+    queue_out(conn, n, false);
+    return;
+  }
   if (message.method == "GET" && (message.target == "/health" || message.target == "/healthz")) {
     const char* body = conn.keep_alive
                            ? "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\n"
@@ -942,6 +1030,7 @@ void pump_read(Core& core, Conn& conn) {
     send_status(core, conn, 400, "only POST is served");
     return;
   }
+  conn.start_us = steady_us();
   ChatFields fields;
   char prompt[kMaxText];
   std::size_t prompt_len = 0;
@@ -972,6 +1061,7 @@ void pump_read(Core& core, Conn& conn) {
                                     ? write_chat_sse(model, record.response, std::span<std::byte>(conn.outb, kBufBytes))
                                     : write_chat_json(model, record.response, std::span<std::byte>(conn.outb, kBufBytes));
           if (n > 0) {
+            observe(core, conn, ObserveKind::Hit);
             queue_out(conn, n, conn.keep_alive);
             return;
           }
@@ -995,6 +1085,15 @@ void pump_read(Core& core, Conn& conn) {
 }
 
 void begin_proxy(Core& core, Conn& conn) {
+  if (core.impl->config.chaos && core.impl->chaos_drop_upstream.load(std::memory_order_relaxed) != 0) {
+    if (conn.internal) {
+      cluster_fill_failed(core, conn);
+      recycle(core, conn);
+      return;
+    }
+    send_status(core, conn, 502, "upstream unavailable");
+    return;
+  }
   if (!core.upstream_circuit.allow(mono_ms())) {
     if (conn.internal) {
       cluster_fill_failed(core, conn);
@@ -1640,6 +1739,9 @@ void core_main(Server::Impl* impl, int core_id) {
   cfg.ef_construction = 64;
   cfg.ef_search = 64;
   Core core(impl, core_id, cfg, path);
+  if (impl->published != nullptr) {
+    core.published = &impl->published[core_id];
+  }
   std::uint32_t conns = impl->config.max_connections == 0 ? 128u : impl->config.max_connections;
   if (conns > kMaxConns) {
     conns = kMaxConns;
@@ -1876,6 +1978,8 @@ bool Server::start() {
     }
     delete impl_->mail;
     impl_->mail = nullptr;
+    delete[] impl_->published;
+    impl_->published = nullptr;
   };
   impl_->use_uring = false;
 #ifdef KESTREL_HAS_LIBURING
@@ -1926,6 +2030,12 @@ bool Server::start() {
   impl_->failed.store(false, std::memory_order_relaxed);
   impl_->fell_back.store(false, std::memory_order_relaxed);
   impl_->ready.store(0, std::memory_order_relaxed);
+  impl_->published = new (std::nothrow) Published[static_cast<std::size_t>(impl_->core_count)];
+  if (impl_->published == nullptr) {
+    std::fprintf(stderr, "kestrel: metrics failed\n");
+    release_sockets();
+    return false;
+  }
   for (int i = 0; i < impl_->core_count; ++i) {
     impl_->threads[i] = std::thread(core_main, impl_, i);
     impl_->thread_count = i + 1;
@@ -1959,6 +2069,8 @@ void Server::stop() noexcept {
   }
   delete impl_->mail;
   impl_->mail = nullptr;
+  delete[] impl_->published;
+  impl_->published = nullptr;
   for (int i = 0; i < kMaxCores; ++i) {
     if (impl_->wake_fd[i] >= 0) {
       ::close(impl_->wake_fd[i]);

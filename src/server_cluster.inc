@@ -43,6 +43,7 @@ struct Waiter {
 };
 
 struct Cluster {
+  Server::Impl* impl = nullptr;
   HashRing ring;
   Swim swim;
   PeerConn peers[kMaxPeers]{};
@@ -320,7 +321,7 @@ void cluster_emit(Core& core, Cluster& cluster, const SwimAction& action) noexce
 
 void waiter_clear(Waiter& waiter) noexcept { waiter = Waiter{}; }
 
-[[nodiscard]] bool serve_text(Core& core, Conn& conn, std::string_view response) {
+[[nodiscard]] bool serve_text(Core& core, Conn& conn, std::string_view response, ObserveKind kind) {
   const std::string_view model =
       conn.model_len == 0 ? std::string_view("kestrel") : std::string_view(conn.model, conn.model_len);
   const std::size_t n = conn.client_stream
@@ -329,6 +330,7 @@ void waiter_clear(Waiter& waiter) noexcept { waiter = Waiter{}; }
   if (n == 0) {
     return false;
   }
+  observe(core, conn, kind);
   queue_out(conn, n, conn.keep_alive);
   rearm(core, conn);
   return true;
@@ -396,7 +398,7 @@ void complete_fill_waiters(Core& core, Cluster& cluster, std::uint64_t key, std:
       if (waiter.conn < core.conn_cap) {
         Conn& conn = core.conns[waiter.conn];
         if (conn.phase == Phase::AwaitCluster && conn.epoch == waiter.epoch) {
-          if (!serve_text(core, conn, response)) {
+          if (!serve_text(core, conn, response, ObserveKind::Fill)) {
             send_status(core, conn, 502, "cache response too large");
           }
         }
@@ -465,6 +467,10 @@ void cluster_fill_failed(Core& core, Conn& conn) noexcept {
 }
 
 [[nodiscard]] bool peer_usable(Cluster& cluster, MemberEndpoint endpoint, std::uint64_t now) noexcept {
+  if (cluster.impl != nullptr && cluster.impl->config.chaos &&
+      cluster.impl->chaos_drop_peers.load(std::memory_order_relaxed) != 0) {
+    return false;
+  }
   PeerConn* peer = peer_find(cluster, endpoint);
   if (peer == nullptr) {
     return false;
@@ -528,7 +534,7 @@ bool decide_miss(Core& core, Cluster& cluster, int reply_core, std::uint32_t con
   std::size_t cached_len = 0;
   if (lookup_copy(core, prompt, cached, sizeof(cached), cached_len, vec)) {
     if (local != nullptr && reply_core == core.id) {
-      if (!serve_text(core, *local, std::string_view(cached, cached_len))) {
+      if (!serve_text(core, *local, std::string_view(cached, cached_len), ObserveKind::Hit)) {
         send_status(core, *local, 502, "cache response too large");
       }
       return false;
@@ -727,7 +733,7 @@ void on_cache_entry(Core& core, Cluster& cluster, const DecodedFrame& frame) noe
     if (waiter.core == core.id && waiter.conn < core.conn_cap) {
       Conn& conn = core.conns[waiter.conn];
       if (conn.phase == Phase::AwaitCluster && conn.epoch == waiter.epoch) {
-        if (!serve_text(core, conn, view.response)) {
+        if (!serve_text(core, conn, view.response, ObserveKind::Copy)) {
           send_status(core, conn, 502, "cache response too large");
         }
       }
@@ -1128,7 +1134,7 @@ void drain_mail(Core& core) noexcept {
         if (view.conn < core.conn_cap) {
           Conn& conn = core.conns[view.conn];
           if (conn.phase == Phase::AwaitCluster) {
-            if (!serve_text(core, conn, view.response)) {
+            if (!serve_text(core, conn, view.response, ObserveKind::Hit)) {
               send_status(core, conn, 502, "cache response too large");
               rearm(core, conn);
             }
@@ -1171,6 +1177,9 @@ void drain_wake_fd(Core& core) noexcept {
 }
 
 void cluster_on_loop(Core& core) noexcept {
+  if (core.published != nullptr) {
+    publish_stats(core.stats, *core.published);
+  }
   drain_wake_fd(core);
   drain_mail(core);
   Cluster* cluster = cluster_of(core.impl);
@@ -1288,6 +1297,7 @@ void cluster_setup(Core& core) noexcept {
       return;
     }
   }
+  cluster->impl = core.impl;
   cluster->self.addr = core.impl->self_addr;
   cluster->self.port = core.impl->peer_port;
   cluster->listen_fd = core.impl->peer_listen;

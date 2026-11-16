@@ -21,7 +21,7 @@ void usage() noexcept {
   std::fputs(
       "usage: kestreld [--bind ADDR] [--port N] [--cores N] [--dim N]\n"
       "                [--threshold F] [--wal DIR] [--upstream ADDR:PORT]\n"
-      "                [--peer-port N] [--advertise ADDR] [--peers ADDR:PORT,...] [--epoll]\n",
+      "                [--peer-port N] [--advertise ADDR] [--peers ADDR:PORT,...] [--epoll] [--chaos]\n",
       stderr);
 }
 
@@ -124,6 +124,8 @@ int main(int argc, char** argv) {
       }
     } else if (std::strcmp(arg, "--epoll") == 0) {
       config.force_epoll = true;
+    } else if (std::strcmp(arg, "--chaos") == 0) {
+      config.chaos = true;
     } else if (std::strcmp(arg, "--peer-port") == 0) {
       if (!parse_u16(need("--peer-port"), config.peer_port) || config.peer_port == 0) {
         std::fputs("kestrel: --peer-port is not a port\n", stderr);

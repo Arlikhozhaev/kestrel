@@ -35,6 +35,8 @@ struct ServerConfig {
   std::uint16_t peer_port = 0;
   const char* advertise_host = nullptr;
   const char* peers = nullptr;
+  // Off unless set. GET /debug and POST /chaos exist only then.
+  bool chaos = false;
 };
 
 class Server {

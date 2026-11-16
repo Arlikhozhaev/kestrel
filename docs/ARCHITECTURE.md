@@ -1,6 +1,6 @@
 # Kestrel phase 0 architecture
 
-Phase 0 freezes the memory layout and the two wire images the rest of the system is built on. Phase 1 is the single-node engine on top of those layouts: one reactor thread per physical core, an HNSW index, and a WAL. Phase 2 adds hashed owners, SWIM, and a local copy after the first fetch. The layouts below do not move.
+Phase 0 freezes the memory layout and the two wire images the rest of the system is built on. Phase 1 is the single-node engine on top of those layouts: one reactor thread per physical core, an HNSW index, and a WAL. Phase 2 adds hashed owners, SWIM, and a local copy after the first fetch. Phase 3 records request time in a per-core HDR histogram and exposes it as a Prometheus scrape. The layouts below do not move.
 
 Host this was measured on, and that the defaults match:
 
@@ -211,3 +211,11 @@ The circuit breaker is per upstream, on each core, and per peer, on core 0. Five
 Cluster defaults off, so a single process behaves as Phase 1. `--peer-port` turns it on and the CLI rejects port 0. `--peers` without `--peer-port` is an error. One extra upstream fill is accepted when membership changes and the ring moves a key. There is no migration protocol.
 
 SWIM runs on core 0, one probe at a time: a direct ping, one indirect ping, then suspected, then dead. Period, timeout, and suspect are 200 ms, 200 ms, and 1000 ms. A higher incarnation wins. A Hello whose incarnation is at or below a dead member's is taken as one past that incarnation, so a restart is not stuck.
+
+## Phase 3 observation
+
+Each core keeps four HDR histograms: hit, fill, copy, and error. Two significant figures, one microsecond units, up to 60 seconds. The clock is `CLOCK_MONOTONIC`. The sample is server time from the chat request being recognized to the response being queued, or to the upstream message being finished. It is not client RTT. A local hit is `hit`. An owner fill of a real client is `fill`. A copy fetched from another process and served here is `copy`. A generated 4xx or 5xx after that clock started is `error`. Health, metrics, and debug are not samples. The synthetic connection an owner opens to its own upstream is not a sample; the client that waited on it is.
+
+The histogram is private to the reactor thread. `record` is one plain increment and a dirty flag. At the start of the next loop, if the flag is set, the core publishes a seqlock copy: odd sequence, relaxed stores, even sequence. `GET /metrics` waits out an odd sequence, copies every kind under one even sequence, and merges the cores. A core that stays odd across the wait is omitted for that scrape. The text is a classic Prometheus histogram, coarser than the HDR. A bucket is added to a `le` only when the whole HDR range sits at or below that bound, so a sample is never reported as smaller than it was. The sixteen most recent samples on a core are a flight recorder. They are printed on the debug page and are not Prometheus labels.
+
+`GET /metrics` is always on. `GET /debug` and `POST /chaos` exist only with `--chaos`. The page has no script. The body is one of `upstream=drop`, `upstream=ok`, `peers=drop`, `peers=ok`. Dropping the upstream fails the fill the same way an open circuit does, and it does not consume the half-open trial. Dropping peers makes every peer unusable, so a secondary owner may fill. Cluster behavior is otherwise unchanged. The feature hash is unchanged. This tree still publishes no latency number.

@@ -440,6 +440,96 @@ void test_cluster(bool force_epoll) {
   upstream.stop();
 }
 
+[[nodiscard]] std::string http_get(std::uint16_t port, const char* path) {
+  const int fd = connect_port(port);
+  CHECK(fd >= 0);
+  std::string req = "GET ";
+  req += path;
+  req += " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+  CHECK(write_all(fd, req.data(), req.size()));
+  std::string response;
+  CHECK(read_response(fd, response));
+  ::close(fd);
+  return response;
+}
+
+void test_metrics(bool force_epoll) {
+  char dir[] = "/tmp/kestrel-metrics-XXXXXX";
+  CHECK(mkdtemp(dir) != nullptr);
+  Upstream upstream;
+  upstream.start();
+  kestrel::ServerConfig cfg;
+  cfg.bind_host = "127.0.0.1";
+  cfg.port = 0;
+  cfg.cores = 1;
+  cfg.wal_dir = dir;
+  cfg.upstream_host = "127.0.0.1";
+  cfg.upstream_port = upstream.port.load();
+  cfg.force_epoll = force_epoll;
+  cfg.max_nodes = 128;
+  cfg.max_connections = 8;
+  kestrel::Server server(cfg);
+  CHECK(server.start());
+  const std::string hidden = http_get(server.port(), "/debug");
+  CHECK(hidden.find("404") != std::string::npos);
+  const std::string before = http_get(server.port(), "/metrics");
+  CHECK(before.find("kestrel_request_duration_seconds_count{result=\"hit\"} 0\n") != std::string::npos);
+  const int fd = connect_port(server.port());
+  CHECK(fd >= 0);
+  const std::string req = chat_request("ping", false);
+  CHECK(write_all(fd, req.data(), req.size()));
+  std::string response;
+  CHECK(read_response(fd, response));
+  CHECK(response.find("pong") != std::string::npos);
+  ::close(fd);
+  const std::string after = http_get(server.port(), "/metrics");
+  CHECK(after.find("kestrel_request_duration_seconds_count{result=\"fill\"} 1\n") != std::string::npos);
+  CHECK(upstream.accepts.load() == 1);
+  server.stop();
+  upstream.stop();
+}
+
+void test_chaos(bool force_epoll) {
+  char dir[] = "/tmp/kestrel-chaos-XXXXXX";
+  CHECK(mkdtemp(dir) != nullptr);
+  Upstream upstream;
+  upstream.start();
+  kestrel::ServerConfig cfg;
+  cfg.bind_host = "127.0.0.1";
+  cfg.port = 0;
+  cfg.cores = 1;
+  cfg.wal_dir = dir;
+  cfg.upstream_host = "127.0.0.1";
+  cfg.upstream_port = upstream.port.load();
+  cfg.force_epoll = force_epoll;
+  cfg.chaos = true;
+  cfg.max_nodes = 128;
+  cfg.max_connections = 8;
+  kestrel::Server server(cfg);
+  CHECK(server.start());
+  const std::string off = http_get(server.port(), "/debug");
+  CHECK(off.find("drop upstream") != std::string::npos);
+  const int fd = connect_port(server.port());
+  CHECK(fd >= 0);
+  const std::string drop = "POST /chaos HTTP/1.1\r\nHost: localhost\r\nContent-Length: 13\r\nConnection: close\r\n\r\nupstream=drop";
+  CHECK(write_all(fd, drop.data(), drop.size()));
+  std::string dropped;
+  CHECK(read_response(fd, dropped));
+  CHECK(dropped.find("200") != std::string::npos);
+  ::close(fd);
+  const int miss = connect_port(server.port());
+  CHECK(miss >= 0);
+  const std::string req = chat_request("ping", false);
+  CHECK(write_all(miss, req.data(), req.size()));
+  std::string denied;
+  CHECK(read_response(miss, denied));
+  CHECK(denied.find("502") != std::string::npos);
+  ::close(miss);
+  CHECK(upstream.accepts.load() == 0);
+  server.stop();
+  upstream.stop();
+}
+
 }  // namespace
 
 int main() {
@@ -451,5 +541,9 @@ int main() {
   test_cluster(true);
   test_cores(false);
   test_cluster(false);
+  test_metrics(true);
+  test_chaos(true);
+  test_metrics(false);
+  test_chaos(false);
   return kestrel::test::failures.load() == 0 ? 0 : 1;
 }
