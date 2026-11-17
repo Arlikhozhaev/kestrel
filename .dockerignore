@@ -1,0 +1,6 @@
+.git
+build
+bench/out
+cmake-build-*
+*.o
+*.a

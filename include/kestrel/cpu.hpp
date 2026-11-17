@@ -10,8 +10,10 @@ namespace kestrel {
 // share a 32 KiB L1d and the same execution units. That is the wrong
 // place to put two hot reactors.
 //
-// Guest affinity is real (pthread_setaffinity_np / sched_getcpu). On WSL2
-// the host can still migrate the VM's vCPUs, so a number taken here is a
+// Guest affinity is real (pthread_setaffinity_np / sched_getcpu). The pin set
+// is the sysfs physical cores that also sit in this process's sched_getaffinity
+// mask, so a container cpuset is not asked to run a thread the kernel will reject.
+// On WSL2 the host can still migrate the VM's vCPUs, so a number taken here is a
 // development number, not the launch p99.9 record.
 inline constexpr int kMaxLogicalCpus = 256;
 

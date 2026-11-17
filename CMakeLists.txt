@@ -19,7 +19,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-set(KESTREL_MARCH native CACHE STRING "Argument to -march=")
+set(KESTREL_MARCH native CACHE STRING "Argument to -march=. Container builds use x86-64-v3 or armv8-a+simd.")
+option(KESTREL_STATIC "Link kestreld -static. For the musl Distroless image, not for sanitizers." OFF)
 set(KESTREL_L2_BYTES 262144 CACHE STRING "Per-core L2 budget in bytes; rings larger than this fail to compile")
 set(KESTREL_SANITIZER "" CACHE STRING "Sanitizer: empty, address, thread, or undefined")
 set_property(CACHE KESTREL_SANITIZER PROPERTY STRINGS "" address thread undefined)
@@ -29,6 +30,23 @@ if(NOT KESTREL_SANITIZER STREQUAL ""
    AND NOT KESTREL_SANITIZER STREQUAL "thread"
    AND NOT KESTREL_SANITIZER STREQUAL "undefined")
   message(FATAL_ERROR "KESTREL_SANITIZER must be empty, address, thread, or undefined")
+endif()
+if(KESTREL_STATIC AND NOT KESTREL_SANITIZER STREQUAL "")
+  message(FATAL_ERROR "KESTREL_STATIC cannot be combined with a sanitizer")
+endif()
+if(KESTREL_STATIC)
+  execute_process(
+    COMMAND "${CMAKE_CXX_COMPILER}" -dumpmachine
+    OUTPUT_VARIABLE KESTREL_DUMPMACHINE
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+  )
+  if(NOT KESTREL_DUMPMACHINE MATCHES "musl")
+    message(WARNING
+      "KESTREL_STATIC with ${KESTREL_DUMPMACHINE} links glibc. "
+      "glibc warns about NSS in a static binary. The data plane calls inet_pton, not getaddrinfo. "
+      "The Distroless static image is built with musl.")
+  endif()
 endif()
 
 find_package(Threads REQUIRED)
@@ -65,8 +83,17 @@ target_compile_definitions(kestrel_core
 )
 target_link_libraries(kestrel_core PUBLIC Threads::Threads)
 if(TARGET PkgConfig::LIBURING)
-  target_link_libraries(kestrel_core PUBLIC PkgConfig::LIBURING)
   target_compile_definitions(kestrel_core PUBLIC KESTREL_HAS_LIBURING=1)
+  if(KESTREL_STATIC)
+    find_library(KESTREL_LIBURING_A NAMES liburing.a
+      HINTS ${LIBURING_STATIC_LIBRARY_DIRS} ${LIBURING_LIBRARY_DIRS})
+    if(NOT KESTREL_LIBURING_A)
+      message(FATAL_ERROR "KESTREL_STATIC found liburing headers but not liburing.a. Install the static archive.")
+    endif()
+    target_link_libraries(kestrel_core PUBLIC "${KESTREL_LIBURING_A}")
+  else()
+    target_link_libraries(kestrel_core PUBLIC PkgConfig::LIBURING)
+  endif()
 endif()
 
 target_compile_options(kestrel_core PUBLIC
@@ -110,7 +137,7 @@ elseif(KESTREL_SANITIZER STREQUAL "undefined")
 endif()
 
 message(STATUS "Kestrel ${PROJECT_VERSION}  march=${KESTREL_MARCH}  "
-               "sanitizer='${KESTREL_SANITIZER}'  "
+               "sanitizer='${KESTREL_SANITIZER}'  static=${KESTREL_STATIC}  "
                "compiler=${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 
 enable_testing()
@@ -141,6 +168,10 @@ endfunction()
 
 add_executable(kestreld src/kestreld.cpp)
 target_link_libraries(kestreld PRIVATE kestrel_core)
+if(KESTREL_STATIC)
+  target_link_options(kestreld PRIVATE -static -static-libgcc -static-libstdc++)
+  target_link_options(kestreld PRIVATE $<$<CONFIG:Release>:-Wl,--strip-all>)
+endif()
 
 kestrel_test(spsc_ring_test tests/spsc_ring_test.cpp)
 kestrel_test(arena_slab_test tests/arena_slab_test.cpp)

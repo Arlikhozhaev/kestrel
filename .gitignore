@@ -7,3 +7,6 @@ compile_commands.json
 *.so
 *.d
 a.out
+bench/out/
+__pycache__/
+*.pyc

@@ -40,7 +40,7 @@ hit. This tree publishes no latency numbers.
 | 1 | `io_uring` or epoll, HTTP/SSE, HNSW, WAL | this tree |
 | 2 | Consistent hashing, SWIM, replication, circuit breaker | this tree |
 | 3 | HDR histograms, traces, chaos switch | this tree |
-| 4 | `wrk2`/`k6` numbers, Distroless image | not started |
+| 4 | `wrk2` harness, Distroless image | harness and Dockerfile in this tree; no published number |
 
 `kestrel-cli` is not written yet. `liburing` is linked when pkg-config finds it; otherwise the reactor uses epoll.
 
@@ -73,3 +73,17 @@ GitHub Actions (`.github/workflows/ci.yml`) runs the same three builds on Ubuntu
 ```
 
 `--epoll` forces the epoll reactor. `--upstream` is `IPv4:PORT`. A miss with no upstream is a 502. `--peer-port` turns the cluster on. `--peers` is `IPv4:PORT,IPv4:PORT` and requires `--peer-port`. `--advertise` is the IPv4 address other processes put in their peer list. `--help` prints the flags. Unknown flags exit 2.
+
+## Benchmark
+
+`bench/run_benchmark.sh` drives `wrk2` at a constant `-R`. The client repeats exact prompts or sends fresh ones. A repeated prompt is a hit after warmup. A fresh prompt is a miss. The script writes `bench/out/<stamp>/report.md` from that run's `wrk2` log and from the before/after `/metrics` scrape. Server columns are quantiles of the exported buckets, which are coarser than the in-process histogram. The script does not fill in a missing sample.
+
+The process it starts on port 18080 answers chat completions and is not a model server. Set `UPSTREAM` to an `IPv4:PORT` when the comparison should be against a real server. `kestreld` pins its own reactor threads. Do not wrap it in `taskset`.
+
+## Image
+
+`Dockerfile` builds `kestreld` with musl and `-DKESTREL_STATIC=ON`, then copies that one binary into `gcr.io/distroless/static-debian12:nonroot`. The image has no shell. The process runs as uid 65532 and listens on 8080. Metrics are on that same port. The default WAL path is `/home/nonroot/wal`. A mounted volume has to be writable by uid 65532 (`fsGroup: 65532`, or `chown 65532:65532` on the host directory).
+
+The pin set is the physical cores that are also in the process affinity mask. A cpuset that hides a logical CPU is not asked to run a thread there. If `io_uring_setup` is rejected, the reactor uses epoll. `--epoll` forces that path.
+
+`-DKESTREL_STATIC=ON` is refused when a sanitizer is on. The default build still links liburing dynamically when pkg-config finds it. A glibc `-static` link warns about NSS; this program resolves addresses with `inet_pton`. The image build does not use that glibc link.

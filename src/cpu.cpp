@@ -108,6 +108,16 @@ bool parse_cpu_list(const char* spec, int* out, int& count, int max_count) noexc
   return count > 0;
 }
 
+[[nodiscard]] bool cpu_allowed(int cpu, const cpu_set_t& mask, bool have_mask) noexcept {
+  if (!have_mask) {
+    return true;
+  }
+  if (cpu < 0 || cpu >= CPU_SETSIZE) {
+    return false;
+  }
+  return CPU_ISSET(cpu, &mask) != 0;
+}
+
 bool read_cpu_file(int cpu, const char* leaf, char* buffer, std::size_t buffer_bytes) noexcept {
   char path[160];
   const int written = std::snprintf(path, sizeof(path),
@@ -126,9 +136,25 @@ bool load_topology(Topology& out) noexcept {
   if (!read_file("/sys/devices/system/cpu/online", online, sizeof(online))) {
     return false;
   }
+  int online_ids[kMaxLogicalCpus];
+  int online_count = 0;
+  if (!parse_cpu_list(online, online_ids, online_count, kMaxLogicalCpus)) {
+    return false;
+  }
+  cpu_set_t allowed;
+  CPU_ZERO(&allowed);
+  const bool have_mask = ::sched_getaffinity(0, sizeof(allowed), &allowed) == 0;
+
   int logical[kMaxLogicalCpus];
   int logical_count = 0;
-  if (!parse_cpu_list(online, logical, logical_count, kMaxLogicalCpus)) {
+  for (int i = 0; i < online_count; ++i) {
+    if (!cpu_allowed(online_ids[i], allowed, have_mask)) {
+      continue;
+    }
+    logical[logical_count] = online_ids[i];
+    ++logical_count;
+  }
+  if (logical_count == 0) {
     return false;
   }
 
@@ -178,7 +204,7 @@ bool load_topology(Topology& out) noexcept {
     }
     int sibling = -1;
     for (int s = 0; s < sibling_count; ++s) {
-      if (siblings[s] == cpu) {
+      if (siblings[s] == cpu || !cpu_allowed(siblings[s], allowed, have_mask)) {
         continue;
       }
       if (sibling < 0 || siblings[s] < sibling) {

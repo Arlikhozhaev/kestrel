@@ -1,0 +1,151 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+jobs:
+  verify:
+    name: verify / ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: release
+            config: Release
+            sanitizer: ""
+            march: x86-64-v3
+          - name: asan
+            config: Debug
+            sanitizer: address
+            march: x86-64-v3
+          - name: tsan
+            config: Debug
+            sanitizer: thread
+            march: x86-64-v3
+    steps:
+      - uses: actions/checkout@v4
+      - name: packages
+        run: sudo apt-get update && sudo apt-get install -y g++ cmake pkg-config
+      - name: configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=${{ matrix.config }}
+          -DKESTREL_SANITIZER=${{ matrix.sanitizer }}
+          -DKESTREL_MARCH=${{ matrix.march }}
+      - name: build
+        run: cmake --build build -j
+      - name: test
+        run: ctest --test-dir build --output-on-failure
+
+  binaries:
+    name: static / ${{ matrix.arch }}
+    needs: verify
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            march: x86-64-v3
+          - arch: arm64
+            platform: linux/arm64
+            march: armv8-a+simd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: extract
+        run: |
+          set -eux
+          mkdir -p dist
+          docker buildx build \
+            --platform ${{ matrix.platform }} \
+            --target builder \
+            --build-arg KESTREL_MARCH=${{ matrix.march }} \
+            --output type=local,dest=dist/stage-${{ matrix.arch }} \
+            .
+          bin=$(find "dist/stage-${{ matrix.arch }}" -type f -name kestreld -print -quit)
+          test -n "$bin"
+          file "$bin" | grep -q "statically linked"
+          cp "$bin" "dist/kestreld-linux-${{ matrix.arch }}"
+          chmod +x "dist/kestreld-linux-${{ matrix.arch }}"
+          tar -C dist -czf "dist/kestreld-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz" \
+            "kestreld-linux-${{ matrix.arch }}"
+          sha256sum "dist/kestreld-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz" \
+            > "dist/kestreld-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kestreld-linux-${{ matrix.arch }}
+          path: |
+            dist/kestreld-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz
+            dist/kestreld-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz.sha256
+
+  image:
+    name: distroless
+    needs: verify
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - id: name
+        name: registry name
+        run: echo "image=ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.name.outputs.image }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+      - name: size
+        run: |
+          set -eux
+          docker buildx build --platform linux/amd64 --load -t kestreld:size-check .
+          bytes=$(docker image inspect kestreld:size-check --format='{{.Size}}')
+          echo "image bytes ${bytes}"
+          test "${bytes}" -le 26214400
+      - id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - uses: sigstore/cosign-installer@v3
+      - name: sign
+        run: cosign sign --yes "${{ steps.name.outputs.image }}@${{ steps.push.outputs.digest }}"
+
+  release:
+    name: github release
+    needs: [binaries, image]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.sha256
