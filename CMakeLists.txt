@@ -110,6 +110,14 @@ target_compile_options(kestrel_core PUBLIC
   -march=${KESTREL_MARCH}
 )
 
+# AArch64 GCC outlines atomics into libgcc helpers. A -static link of libstdc++
+# does not always rescan libgcc for those calls. Inlining keeps the image linkable.
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag(-mno-outline-atomics KESTREL_NO_OUTLINE_ATOMICS)
+if(KESTREL_NO_OUTLINE_ATOMICS)
+  target_compile_options(kestrel_core PUBLIC -mno-outline-atomics)
+endif()
+
 # Sanitizer builds force -O1. ASan and TSan cannot be combined.
 # The address target also enables UBSan: the two catch different bugs
 # and they do compose. TSan does not.
@@ -171,6 +179,9 @@ target_link_libraries(kestreld PRIVATE kestrel_core)
 if(KESTREL_STATIC)
   target_link_options(kestreld PRIVATE -static -static-libgcc -static-libstdc++)
   target_link_options(kestreld PRIVATE $<$<CONFIG:Release>:-Wl,--strip-all>)
+  if(KESTREL_NO_OUTLINE_ATOMICS)
+    target_link_libraries(kestreld PRIVATE gcc)
+  endif()
 endif()
 
 kestrel_test(spsc_ring_test tests/spsc_ring_test.cpp)

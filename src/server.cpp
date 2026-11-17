@@ -32,6 +32,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <signal.h>
+#include <pthread.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
@@ -73,11 +74,19 @@ struct Server::Impl {
   Published* published = nullptr;
   std::atomic<std::uint32_t> chaos_drop_upstream{0};
   std::atomic<std::uint32_t> chaos_drop_peers{0};
-  std::thread threads[64];
+  // Musl's pthread default stack is 128 KiB. CoreStats is ~80 KiB and a scrape
+  // copies two sets of histograms (~160 KiB) on this same thread.
+  struct Launch {
+    Server::Impl* self;
+    int core_id;
+  };
+  Launch launch[64]{};
+  pthread_t threads[64]{};
 };
 
 namespace {
 
+constexpr std::size_t kReactorStackBytes = 8u * 1024u * 1024u;
 constexpr std::size_t kBufBytes = 64u * 1024u;
 constexpr std::size_t kMaxText = 16u * 1024u;
 constexpr std::size_t kHeaderCap = 8u * 1024u;
@@ -1761,6 +1770,12 @@ void core_main(Server::Impl* impl, int core_id) {
   run_epoll(core);
 }
 
+void* core_launch(void* raw) noexcept {
+  auto* launch = static_cast<Server::Impl::Launch*>(raw);
+  core_main(launch->self, launch->core_id);
+  return nullptr;
+}
+
 #include "server_cluster.inc"
 
 }  // namespace
@@ -2036,10 +2051,36 @@ bool Server::start() {
     release_sockets();
     return false;
   }
+  pthread_attr_t attr;
+  if (::pthread_attr_init(&attr) != 0) {
+    std::fprintf(stderr, "kestrel: reactor stack failed\n");
+    release_sockets();
+    return false;
+  }
+  if (::pthread_attr_setstacksize(&attr, kReactorStackBytes) != 0) {
+    std::fprintf(stderr, "kestrel: reactor stack failed\n");
+    ::pthread_attr_destroy(&attr);
+    release_sockets();
+    return false;
+  }
   for (int i = 0; i < impl_->core_count; ++i) {
-    impl_->threads[i] = std::thread(core_main, impl_, i);
+    impl_->launch[i].self = impl_;
+    impl_->launch[i].core_id = i;
+    const int rc = ::pthread_create(&impl_->threads[i], &attr, core_launch, &impl_->launch[i]);
+    if (rc != 0) {
+      std::fprintf(stderr, "kestrel: reactor thread failed: %s\n", std::strerror(rc));
+      ::pthread_attr_destroy(&attr);
+      impl_->stop.store(true, std::memory_order_release);
+      for (int j = 0; j < impl_->thread_count; ++j) {
+        ::pthread_join(impl_->threads[j], nullptr);
+      }
+      impl_->thread_count = 0;
+      release_sockets();
+      return false;
+    }
     impl_->thread_count = i + 1;
   }
+  ::pthread_attr_destroy(&attr);
   while (impl_->ready.load(std::memory_order_acquire) < impl_->core_count) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
@@ -2057,9 +2098,7 @@ void Server::stop() noexcept {
   }
   impl_->stop.store(true, std::memory_order_release);
   for (int i = 0; i < impl_->thread_count; ++i) {
-    if (impl_->threads[i].joinable()) {
-      impl_->threads[i].join();
-    }
+    ::pthread_join(impl_->threads[i], nullptr);
   }
   impl_->thread_count = 0;
   impl_->started = false;
