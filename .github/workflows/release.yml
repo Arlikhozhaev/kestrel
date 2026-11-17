@@ -71,11 +71,12 @@ jobs:
             --platform ${{ matrix.platform }} \
             --target builder \
             --build-arg KESTREL_MARCH=${{ matrix.march }} \
+            --provenance=false \
             --output type=local,dest=dist/stage-${{ matrix.arch }} \
             .
           bin=$(find "dist/stage-${{ matrix.arch }}" -type f -name kestreld -print -quit)
           test -n "$bin"
-          file "$bin" | grep -q "statically linked"
+          file "$bin" | grep -Eq 'statically linked|static-pie linked'
           cp "$bin" "dist/kestreld-linux-${{ matrix.arch }}"
           chmod +x "dist/kestreld-linux-${{ matrix.arch }}"
           tar -C dist -czf "dist/kestreld-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz" \
@@ -116,7 +117,7 @@ jobs:
       - name: size
         run: |
           set -eux
-          docker buildx build --platform linux/amd64 --load -t kestreld:size-check .
+          docker buildx build --platform linux/amd64 --provenance=false --load -t kestreld:size-check .
           bytes=$(docker image inspect kestreld:size-check --format='{{.Size}}')
           echo "image bytes ${bytes}"
           test "${bytes}" -le 26214400

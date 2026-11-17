@@ -9,10 +9,11 @@ ARG TARGETARCH
 ARG KESTREL_MARCH=
 
 # Alpine 3.20 has no liburing-static package. liburing-dev ships liburing.a.
+# The name ninja is virtual (samurai). The default generator is Unix Makefiles,
+# and build-base already provides make.
 RUN apk add --no-cache \
     build-base \
     cmake \
-    ninja \
     linux-headers \
     liburing-dev \
     file
@@ -33,13 +34,13 @@ RUN set -eux; \
     else \
       march="native"; \
     fi; \
-    cmake -S . -B build/release -G Ninja \
+    cmake -S . -B build/release \
       -DCMAKE_BUILD_TYPE=Release \
       -DKESTREL_STATIC=ON \
       -DKESTREL_MARCH="${march}"; \
     cmake --build build/release -j"$(nproc)"; \
     ctest --test-dir build/release --output-on-failure; \
-    file build/release/kestreld | grep -q "statically linked"
+    file build/release/kestreld | grep -Eq 'statically linked|static-pie linked'
 
 FROM gcr.io/distroless/static-debian12:nonroot
 
