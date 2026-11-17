@@ -5,6 +5,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <string_view>
 
 namespace {
 
@@ -82,6 +83,40 @@ void test_feature_hash() {
   const float different = kestrel::dot_product(a, c, 64);
   CHECK(same > 0.99f);
   CHECK(different < 0.97f);
+  char left[128];
+  char right[128];
+  std::memset(left, 'x', sizeof(left));
+  std::memset(right, 'x', sizeof(right));
+  std::memcpy(left, "k00000001", 9);
+  std::memcpy(right, "k00000002", 9);
+  CHECK(embed.embed(std::string_view(left, sizeof(left)), a));
+  CHECK(embed.embed(std::string_view(right, sizeof(right)), b));
+  CHECK(kestrel::dot_product(a, b, 64) < 0.97f);
+
+  kestrel::HnswConfig cfg;
+  cfg.dimension = 64;
+  cfg.max_nodes = 400;
+  kestrel::HnswIndex index(cfg);
+  char text[128];
+  int hits = 0;
+  for (int id = 1; id <= 300; ++id) {
+    std::memset(text, 'x', sizeof(text));
+    text[0] = 'k';
+    int value = id;
+    for (int digit = 8; digit >= 1; --digit) {
+      text[digit] = static_cast<char>('0' + (value % 10));
+      value /= 10;
+    }
+    CHECK(embed.embed(std::string_view(text, sizeof(text)), a));
+    kestrel::HnswHit hit;
+    const std::size_t found = index.search(a, std::span<kestrel::HnswHit>(&hit, 1));
+    if (found == 1 && hit.score >= 0.97f) {
+      ++hits;
+    } else {
+      CHECK(index.insert(a, static_cast<std::uint64_t>(id)) != kestrel::kNilNode);
+    }
+  }
+  CHECK(hits == 0);
 }
 
 }  // namespace

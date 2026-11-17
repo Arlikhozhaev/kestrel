@@ -1039,6 +1039,8 @@ void pump_read(Core& core, Conn& conn) {
     send_status(core, conn, 400, "only POST is served");
     return;
   }
+  // observed stops a second sample of this request. A keep-alive socket carries the next one.
+  conn.observed = false;
   conn.start_us = steady_us();
   ChatFields fields;
   char prompt[kMaxText];

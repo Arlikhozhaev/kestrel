@@ -20,6 +20,18 @@ namespace {
   return c;
 }
 
+// Eight coordinates from mixed high bits. hash % dimension and one sign bit
+// only distinguish 2 * dimension vectors, so different tokens shared one.
+void project(float* out, std::size_t dimension, std::uint64_t hash) noexcept {
+  std::uint64_t mixed = hash;
+  for (std::uint32_t i = 0; i < 8u; ++i) {
+    mixed ^= mixed >> 33;
+    mixed *= 0x9E3779B185EBCA87ull;
+    const std::size_t bucket = static_cast<std::size_t>((mixed >> 32) % dimension);
+    out[bucket] += ((mixed >> 17) & 1ull) != 0ull ? 1.f : -1.f;
+  }
+}
+
 }  // namespace
 
 bool FeatureHashEmbedder::embed(std::string_view text, std::span<float> out) const noexcept {
@@ -50,20 +62,13 @@ bool FeatureHashEmbedder::embed(std::string_view text, std::span<float> out) con
       hash ^= lower_ascii(static_cast<unsigned char>(*p));
       hash *= 1099511628211ull;
     }
-    const std::size_t bucket = static_cast<std::size_t>(hash % dimension_);
-    out[bucket] += (hash & 1ull) != 0 ? 1.f : -1.f;
-    const std::uint64_t hash2 = hash * 0x9E3779B185EBCA87ull;
-    const std::size_t bucket2 = static_cast<std::size_t>(hash2 % dimension_);
-    out[bucket2] += (hash2 & 1ull) != 0 ? 1.f : -1.f;
+    project(out.data(), dimension_, hash);
     if (have_previous && dimension_ > 1) {
       const std::uint64_t bigram = previous ^ (hash + 0x9E3779B97F4A7C15ull);
       out[static_cast<std::size_t>(bigram % dimension_)] += 0.5f;
     }
     previous = hash;
     have_previous = true;
-  }
-  if (dimension_ > 2) {
-    out[dimension_ - 1u] += std::sqrt(static_cast<float>(text.size() + 1u));
   }
   float squared = 0.f;
   for (std::size_t i = 0; i < dimension_; ++i) {

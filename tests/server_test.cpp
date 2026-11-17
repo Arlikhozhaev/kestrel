@@ -485,6 +485,18 @@ void test_metrics(bool force_epoll) {
   const std::string after = http_get(server.port(), "/metrics");
   CHECK(after.find("kestrel_request_duration_seconds_count{result=\"fill\"} 1\n") != std::string::npos);
   CHECK(upstream.accepts.load() == 1);
+  const int kept = connect_port(server.port());
+  CHECK(kept >= 0);
+  const std::string again = chat_request("ping", true);
+  CHECK(write_all(kept, again.data(), again.size()));
+  std::string hit_one;
+  CHECK(read_response(kept, hit_one));
+  CHECK(write_all(kept, again.data(), again.size()));
+  std::string hit_two;
+  CHECK(read_response(kept, hit_two));
+  ::close(kept);
+  const std::string kept_metrics = http_get(server.port(), "/metrics");
+  CHECK(kept_metrics.find("kestrel_request_duration_seconds_count{result=\"hit\"} 2\n") != std::string::npos);
   server.stop();
   upstream.stop();
 }

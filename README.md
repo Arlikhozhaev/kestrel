@@ -1,15 +1,16 @@
 # Kestrel
 
-C++20 self-hosted semantic cache and OpenAI-compatible inference gateway.
-Shared-nothing cores, no external database, no third-party proxy.
+C++20 shared-nothing cache and OpenAI-compatible inference gateway.
+No external database, no third-party proxy.
 
-**Status: Phase 3 of 4.** One process serves an identical prompt from the on-core
+**Status: Phase 4.** One process serves an identical prompt from the on-core
 cache and proxies a miss to an IPv4 model server. With `--peer-port` and
 `--peers`, two hashed owners store each entry. Any other process asks an owner
 once, keeps the copy, and then hits locally. Only an owner calls the model.
 `GET /metrics` is a Prometheus histogram. `--chaos` adds `GET /debug` and
 `POST /chaos`. The embedder is a feature hash, not a model: paraphrases do not
-hit. This tree publishes no latency numbers.
+hit. Tag `v0.4.0` is the release that published the image. This tree publishes
+no latency numbers.
 
 ## Start here
 
@@ -32,7 +33,7 @@ hit. This tree publishes no latency numbers.
 - Optional cluster: consistent hash, SWIM, async replication to two owners, and a local copy after the first fetch. Off unless `--peer-port` is set.
 - Per-core HDR histogram, published once per reactor loop when it changed. `GET /metrics` merges a seqlock copy. `--chaos` serves a plain HTML page with four forms. A hit increments the private counter and does not publish.
 
-## What is not in this tree
+## Phases
 
 | Phase | Contents | State |
 | --- | --- | --- |
@@ -40,15 +41,16 @@ hit. This tree publishes no latency numbers.
 | 1 | `io_uring` or epoll, HTTP/SSE, HNSW, WAL | this tree |
 | 2 | Consistent hashing, SWIM, replication, circuit breaker | this tree |
 | 3 | HDR histograms, traces, chaos switch | this tree |
-| 4 | `wrk2` harness, Distroless image | harness and Dockerfile in this tree; no published number |
+| 4 | `wrk2` harness, Distroless image | harness and Dockerfile in this tree; image published with `v0.4.0`; no latency number |
 
 `kestrel-cli` is not written yet. `liburing` is linked when pkg-config finds it; otherwise the reactor uses epoll.
 
 ## Build
 
 Requires CMake 3.20, g++ with C++20, and pthreads. Development host: g++ 13.3,
-Linux 6.6. Release flags: `-O3 -march=native -Wall -Wextra -Wpedantic -Werror -fno-exceptions -fno-rtti`.
-A container image that must run on other AVX2 machines configures `-DKESTREL_MARCH=x86-64-v3`.
+Linux 6.6. Every target uses `-Wall -Wextra -Wpedantic -Werror -Wconversion -Wshadow -Wstrict-aliasing=2 -fno-exceptions -fno-rtti -fno-omit-frame-pointer -march=${KESTREL_MARCH}`.
+Release adds `-O3 -fno-unwind-tables -fno-asynchronous-unwind-tables`. The development host uses `-march=native`.
+A container build uses `-DKESTREL_MARCH=x86-64-v3` on amd64 and `-DKESTREL_MARCH=armv8-a+simd` on arm64.
 
 ```bash
 cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release
@@ -86,4 +88,4 @@ The process it starts on port 18080 answers chat completions and is not a model 
 
 The pin set is the physical cores that are also in the process affinity mask. A cpuset that hides a logical CPU is not asked to run a thread there. If `io_uring_setup` is rejected, the reactor uses epoll. `--epoll` forces that path.
 
-`-DKESTREL_STATIC=ON` is refused when a sanitizer is on. The default build still links liburing dynamically when pkg-config finds it. A glibc `-static` link warns about NSS; this program resolves addresses with `inet_pton`. The image build does not use that glibc link.
+`-DKESTREL_STATIC=ON` is refused when a sanitizer is on. The default build still links liburing dynamically when pkg-config finds it. That binary is not the image. A glibc `-static` link warns about NSS; this program resolves addresses with `inet_pton`. The image build does not use that glibc link.
