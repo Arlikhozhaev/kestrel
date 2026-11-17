@@ -63,6 +63,7 @@ endif()
 add_library(kestrel_core STATIC
   src/cpu.cpp
   src/hnsw.cpp
+  src/simd.cpp
   src/wal.cpp
   src/feature_hash.cpp
   src/http.cpp
