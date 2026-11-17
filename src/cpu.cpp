@@ -108,6 +108,27 @@ bool parse_cpu_list(const char* spec, int* out, int& count, int max_count) noexc
   return count > 0;
 }
 
+// musl implements CPU_SET by casting cpu_set_t to unsigned long*. At -O3,
+// -Wstrict-aliasing=2 rejects that cast. glibc and musl both store the mask
+// in an unsigned long __bits array, which is the field these helpers touch.
+void clear_set(cpu_set_t& set) noexcept {
+  for (auto& word : set.__bits) {
+    word = 0;
+  }
+}
+
+void set_cpu(cpu_set_t& set, int cpu) noexcept {
+  const auto bit = static_cast<std::size_t>(cpu);
+  constexpr std::size_t width = sizeof(set.__bits[0]) * 8;
+  set.__bits[bit / width] |= static_cast<unsigned long>(1UL << (bit % width));
+}
+
+[[nodiscard]] bool cpu_in_set(const cpu_set_t& set, int cpu) noexcept {
+  const auto bit = static_cast<std::size_t>(cpu);
+  constexpr std::size_t width = sizeof(set.__bits[0]) * 8;
+  return (set.__bits[bit / width] & (1UL << (bit % width))) != 0;
+}
+
 [[nodiscard]] bool cpu_allowed(int cpu, const cpu_set_t& mask, bool have_mask) noexcept {
   if (!have_mask) {
     return true;
@@ -115,7 +136,7 @@ bool parse_cpu_list(const char* spec, int* out, int& count, int max_count) noexc
   if (cpu < 0 || cpu >= CPU_SETSIZE) {
     return false;
   }
-  return CPU_ISSET(cpu, &mask) != 0;
+  return cpu_in_set(mask, cpu);
 }
 
 bool read_cpu_file(int cpu, const char* leaf, char* buffer, std::size_t buffer_bytes) noexcept {
@@ -142,7 +163,7 @@ bool load_topology(Topology& out) noexcept {
     return false;
   }
   cpu_set_t allowed;
-  CPU_ZERO(&allowed);
+  clear_set(allowed);
   const bool have_mask = ::sched_getaffinity(0, sizeof(allowed), &allowed) == 0;
 
   int logical[kMaxLogicalCpus];
@@ -241,8 +262,8 @@ bool pin_thread_to(int cpu) noexcept {
     return false;
   }
   cpu_set_t set;
-  CPU_ZERO(&set);
-  CPU_SET(cpu, &set);
+  clear_set(set);
+  set_cpu(set, cpu);
   return ::pthread_setaffinity_np(::pthread_self(), sizeof(set), &set) == 0;
 }
 
@@ -251,13 +272,13 @@ bool reset_affinity(const Topology& topology) noexcept {
     return false;
   }
   cpu_set_t set;
-  CPU_ZERO(&set);
+  clear_set(set);
   for (int i = 0; i < topology.logical_count; ++i) {
     const int cpu = topology.logical_ids[i];
     if (cpu < 0 || cpu >= CPU_SETSIZE) {
       return false;
     }
-    CPU_SET(cpu, &set);
+    set_cpu(set, cpu);
   }
   return ::pthread_setaffinity_np(::pthread_self(), sizeof(set), &set) == 0;
 }
