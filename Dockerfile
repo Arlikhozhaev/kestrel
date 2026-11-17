@@ -8,13 +8,13 @@ FROM alpine:3.20 AS builder
 ARG TARGETARCH
 ARG KESTREL_MARCH=
 
+# Alpine 3.20 has no liburing-static package. liburing-dev ships liburing.a.
 RUN apk add --no-cache \
     build-base \
     cmake \
     ninja \
     linux-headers \
     liburing-dev \
-    liburing-static \
     file
 
 WORKDIR /src
