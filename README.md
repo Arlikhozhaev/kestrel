@@ -9,7 +9,8 @@ cache and proxies a miss to an IPv4 model server. With `--peer-port` and
 once, keeps the copy, and then hits locally. Only an owner calls the model.
 `GET /metrics` is a Prometheus histogram. `--chaos` adds `GET /debug` and
 `POST /chaos`. The embedder is a feature hash, not a model: paraphrases do not
-hit. Tag `v0.4.0` is the release that published the image. This tree publishes
+hit. The image to run is `ghcr.io/arlikhozhaev/kestrel:0.4.1`. `v0.4.0` still
+shares one vector across different one-token prompts. This tree publishes
 no latency numbers.
 
 ## Start here
@@ -41,7 +42,7 @@ no latency numbers.
 | 1 | `io_uring` or epoll, HTTP/SSE, HNSW, WAL | this tree |
 | 2 | Consistent hashing, SWIM, replication, circuit breaker | this tree |
 | 3 | HDR histograms, traces, chaos switch | this tree |
-| 4 | `wrk2` harness, Distroless image | harness and Dockerfile in this tree; image published with `v0.4.0`; no latency number |
+| 4 | `wrk2` harness, Distroless image | harness and Dockerfile in this tree; image published as `0.4.1`; no latency number |
 
 `kestrel-cli` is not written yet. `liburing` is linked when pkg-config finds it; otherwise the reactor uses epoll.
 
@@ -71,14 +72,26 @@ ctest --test-dir build/tsan --output-on-failure
 GitHub Actions (`.github/workflows/ci.yml`) runs the same three builds on Ubuntu.
 
 ```bash
-./build/release/kestreld --bind 127.0.0.1 --port 8080 --wal /tmp/kestrel-wal --upstream 127.0.0.1:8000
+docker run --rm -p 8080:8080 ghcr.io/arlikhozhaev/kestrel:0.4.1
+
+./build/release/kestreld --bind 127.0.0.1 --port 8080 --wal /tmp/kestrel-wal \
+  --upstream 127.0.0.1:8000 --token s3cret
 ```
+
+```bash
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Authorization: Bearer s3cret' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"m","messages":[{"role":"user","content":"ping"}]}'
+```
+
+`curl -d` sends `Content-Length`. A chunked body is a 400, `chunked encoding is not accepted`. The `0.4.1` image does not check a token. `--token` is in this tree: it requires that bearer on every request except `GET /health` and `GET /healthz`. Leave it unset on a machine where the port is already private. The image listens with no upstream, so `GET /health` answers and a chat completion is a 502 until `--upstream` is set. Arguments after the image name replace the default command, so repeat `--bind`, `--port`, and `--wal`. TLS terminates in front of this process. The image has no certificates.
 
 `--epoll` forces the epoll reactor. `--upstream` is `IPv4:PORT`. A miss with no upstream is a 502. `--peer-port` turns the cluster on. `--peers` is `IPv4:PORT,IPv4:PORT` and requires `--peer-port`. `--advertise` is the IPv4 address other processes put in their peer list. `--help` prints the flags. Unknown flags exit 2.
 
 ## Benchmark
 
-`bench/run_benchmark.sh` drives `wrk2` at a constant `-R`. The client repeats exact prompts or sends fresh ones. A repeated prompt is a hit after warmup. A fresh prompt is a miss. The script writes `bench/out/<stamp>/report.md` from that run's `wrk2` log and from the before/after `/metrics` scrape. Server columns are quantiles of the exported buckets, which are coarser than the in-process histogram. The script does not fill in a missing sample.
+`bench/run_benchmark.sh` drives `wrk2` at a constant `-R`. The client repeats exact prompts or sends fresh ones. Each `wrk2` thread draws ids from its own range, so a fresh prompt is not repeated by the other thread. A repeated prompt is a hit after warmup. A fresh prompt is a miss. The script writes `bench/out/<stamp>/report.md` from that run's `wrk2` log and from the before/after `/metrics` scrape. Server columns are quantiles of the exported buckets, which are coarser than the in-process histogram. The script does not fill in a missing sample.
 
 The process it starts on port 18080 answers chat completions and is not a model server. Set `UPSTREAM` to an `IPv4:PORT` when the comparison should be against a real server. `kestreld` pins its own reactor threads. Do not wrap it in `taskset`.
 

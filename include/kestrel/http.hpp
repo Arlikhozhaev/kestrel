@@ -18,6 +18,8 @@ struct HttpMessage {
   std::string_view method{};
   std::string_view target{};
   std::string_view body{};
+  // Value of the Authorization header, without the name. Empty when absent.
+  std::string_view authorization{};
   std::size_t total = 0;
   bool keep_alive = true;
 };

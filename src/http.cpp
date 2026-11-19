@@ -482,6 +482,8 @@ void append_json_string(Writer& w, std::string_view text) noexcept {
   switch (status) {
     case 400:
       return "Bad Request";
+    case 401:
+      return "Unauthorized";
     case 404:
       return "Not Found";
     case 413:
@@ -596,6 +598,7 @@ ParseStatus parse_http(std::span<const std::byte> buf, HttpMessage& out) noexcep
   bool close_conn = false;
   bool keep_conn = false;
   bool chunked = false;
+  std::string_view authorization{};
   const char* cursor = line_end + 2;
   while (cursor < hend) {
     const char* nl = nullptr;
@@ -646,6 +649,10 @@ ParseStatus parse_http(std::span<const std::byte> buf, HttpMessage& out) noexcep
       if (contains_token(value, value_end, "chunked")) {
         chunked = true;
       }
+    } else if (header_name_eq(cursor, colon, "authorization")) {
+      if (authorization.empty() && value_end >= value) {
+        authorization = std::string_view(value, static_cast<std::size_t>(value_end - value));
+      }
     } else if (header_name_eq(cursor, colon, "connection")) {
       if (contains_token(value, value_end, "close")) {
         close_conn = true;
@@ -681,6 +688,7 @@ ParseStatus parse_http(std::span<const std::byte> buf, HttpMessage& out) noexcep
   out.method = method;
   out.target = target;
   out.body = std::string_view(begin + head_bytes, static_cast<std::size_t>(content_length));
+  out.authorization = authorization;
   out.total = total;
   if (close_conn) {
     out.keep_alive = false;

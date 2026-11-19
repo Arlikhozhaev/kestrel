@@ -51,6 +51,10 @@ void test_rejects() {
   CHECK(kestrel::parse_http(get, out) == kestrel::ParseStatus::Ok);
   CHECK(!out.keep_alive);
   CHECK(out.body.empty());
+  auto auth = as_bytes(
+      "POST /v1/chat/completions HTTP/1.1\r\nAuthorization: Bearer s3cret\r\nContent-Length: 2\r\n\r\n{}");
+  CHECK(kestrel::parse_http(auth, out) == kestrel::ParseStatus::Ok);
+  CHECK(out.authorization == "Bearer s3cret");
 }
 
 void test_json_and_writers() {

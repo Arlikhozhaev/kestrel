@@ -21,7 +21,8 @@ void usage() noexcept {
   std::fputs(
       "usage: kestreld [--bind ADDR] [--port N] [--cores N] [--dim N]\n"
       "                [--threshold F] [--wal DIR] [--upstream ADDR:PORT]\n"
-      "                [--peer-port N] [--advertise ADDR] [--peers ADDR:PORT,...] [--epoll] [--chaos]\n",
+      "                [--peer-port N] [--advertise ADDR] [--peers ADDR:PORT,...]\n"
+      "                [--token SECRET] [--epoll] [--chaos]\n",
       stderr);
 }
 
@@ -137,6 +138,12 @@ int main(int argc, char** argv) {
     } else if (std::strcmp(arg, "--peers") == 0) {
       config.peers = need("--peers");
       config.cluster = true;
+    } else if (std::strcmp(arg, "--token") == 0) {
+      config.token = need("--token");
+      if (config.token[0] == '\0') {
+        std::fputs("kestrel: --token is empty\n", stderr);
+        return 2;
+      }
     } else if (std::strcmp(arg, "--help") == 0) {
       usage();
       return 0;

@@ -52,6 +52,8 @@ struct Server::Impl {
   char upstream_host[64]{};
   char advertise_host[64]{};
   char peers_text[1200]{};
+  char token[128]{};
+  std::uint8_t token_len = 0;
   sockaddr_in upstream_addr{};
   int listen_fds[64]{};
   int wake_fd[64]{};
@@ -938,6 +940,63 @@ void fail_connect(Core& core, Conn& conn) {
   close_conn(core, conn);
 }
 
+[[nodiscard]] bool bearer_ok(std::string_view header, const char* token, std::uint8_t token_len) noexcept {
+  constexpr char kScheme[] = {'b', 'e', 'a', 'r', 'e', 'r', ' '};
+  if (token == nullptr || token_len == 0 || header.size() != sizeof(kScheme) + token_len) {
+    return false;
+  }
+  unsigned diff = 0;
+  for (std::size_t i = 0; i < sizeof(kScheme); ++i) {
+    unsigned char c = static_cast<unsigned char>(header[i]);
+    if (c >= 'A' && c <= 'Z') {
+      c = static_cast<unsigned char>(c + ('a' - 'A'));
+    }
+    diff |= static_cast<unsigned>(c) ^ static_cast<unsigned char>(kScheme[i]);
+  }
+  for (std::uint8_t i = 0; i < token_len; ++i) {
+    diff |= static_cast<unsigned>(static_cast<unsigned char>(header[sizeof(kScheme) + i])) ^
+            static_cast<unsigned>(static_cast<unsigned char>(token[i]));
+  }
+  return diff == 0;
+}
+
+[[nodiscard]] bool headers_say_chunked(std::span<const std::byte> buf) noexcept {
+  if (buf.empty() || buf.data() == nullptr) {
+    return false;
+  }
+  const char* begin = reinterpret_cast<const char*>(buf.data());
+  const char* end = begin + buf.size();
+  const char* limit = end;
+  for (const char* p = begin; p + 3 < end; ++p) {
+    if (p[0] == '\r' && p[1] == '\n' && p[2] == '\r' && p[3] == '\n') {
+      limit = p;
+      break;
+    }
+  }
+  constexpr char kNeedle[] = {'c', 'h', 'u', 'n', 'k', 'e', 'd'};
+  if (static_cast<std::size_t>(limit - begin) < sizeof(kNeedle)) {
+    return false;
+  }
+  for (const char* p = begin; p + sizeof(kNeedle) <= limit; ++p) {
+    unsigned diff = 0;
+    for (std::size_t i = 0; i < sizeof(kNeedle); ++i) {
+      unsigned char c = static_cast<unsigned char>(p[i]);
+      if (c >= 'A' && c <= 'Z') {
+        c = static_cast<unsigned char>(c + ('a' - 'A'));
+      }
+      diff |= static_cast<unsigned>(c) ^ static_cast<unsigned char>(kNeedle[i]);
+    }
+    if (diff == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+[[nodiscard]] bool health_route(const HttpMessage& message) noexcept {
+  return message.method == "GET" && (message.target == "/health" || message.target == "/healthz");
+}
+
 void pump_read(Core& core, Conn& conn) {
   if (conn.phase != Phase::Read || conn.closing) {
     return;
@@ -952,7 +1011,16 @@ void pump_read(Core& core, Conn& conn) {
     return;
   }
   if (status != ParseStatus::Ok) {
-    send_status(core, conn, 400, "malformed http");
+    if (status == ParseStatus::Bad && headers_say_chunked(std::span<const std::byte>(conn.in, conn.in_len))) {
+      send_status(core, conn, 400, "chunked encoding is not accepted");
+    } else {
+      send_status(core, conn, 400, "malformed http");
+    }
+    return;
+  }
+  if (core.impl->token_len != 0 && !health_route(message) &&
+      !bearer_ok(message.authorization, core.impl->token, core.impl->token_len)) {
+    send_status(core, conn, 401, "unauthorized");
     return;
   }
   conn.request_total = message.total;
@@ -1925,6 +1993,21 @@ Server::Server(const ServerConfig& config) : impl_(new (std::nothrow) Impl) {
         !copy_text(impl_->peers_text, sizeof(impl_->peers_text), config.peers)) {
       std::fprintf(stderr, "kestrel: --peers is too long\n");
       impl_->failed.store(true, std::memory_order_relaxed);
+    }
+  }
+  if (config.token != nullptr && config.token[0] != '\0') {
+    const std::size_t n = std::strlen(config.token);
+    bool ok = n > 0 && n <= sizeof(impl_->token);
+    for (std::size_t i = 0; ok && i < n; ++i) {
+      const unsigned char c = static_cast<unsigned char>(config.token[i]);
+      ok = c >= 0x21 && c <= 0x7e;
+    }
+    if (!ok) {
+      std::fputs("kestrel: --token must be 1..128 visible ASCII characters\n", stderr);
+      impl_->failed.store(true, std::memory_order_relaxed);
+    } else {
+      std::memcpy(impl_->token, config.token, n);
+      impl_->token_len = static_cast<std::uint8_t>(n);
     }
   }
 }

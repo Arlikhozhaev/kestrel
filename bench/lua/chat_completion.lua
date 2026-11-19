@@ -18,6 +18,21 @@ local hit_ratio = env_number("KESTREL_HIT_RATIO", 1)
 local payload = env_number("KESTREL_PAYLOAD", 128)
 local pool = env_number("KESTREL_POOL", 32)
 local uniq = env_number("KESTREL_UNIQ_BASE", 1000000)
+local thread_slot = 0
+
+-- wrk2 loads this file once per thread, and each copy starts at the same id.
+-- setup stamps the thread, and init moves that copy's ids out of the other thread's range.
+function setup(thread)
+  thread:set("kestrel_thread", thread_slot)
+  thread_slot = thread_slot + 1
+end
+
+function init(args)
+  local slot = wrk.thread:get("kestrel_thread")
+  if slot ~= nil then
+    uniq = uniq + slot * 100000000
+  end
+end
 
 if payload < 9 or payload > 8192 then
   error("KESTREL_PAYLOAD must be 9..8192")

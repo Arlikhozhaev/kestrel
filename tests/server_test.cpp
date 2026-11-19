@@ -542,6 +542,55 @@ void test_chaos(bool force_epoll) {
   upstream.stop();
 }
 
+void test_token(bool force_epoll) {
+  char dir[] = "/tmp/kestrel-token-XXXXXX";
+  CHECK(mkdtemp(dir) != nullptr);
+  Upstream upstream;
+  upstream.start();
+  kestrel::ServerConfig cfg;
+  cfg.bind_host = "127.0.0.1";
+  cfg.port = 0;
+  cfg.cores = 1;
+  cfg.wal_dir = dir;
+  cfg.upstream_host = "127.0.0.1";
+  cfg.upstream_port = upstream.port.load();
+  cfg.force_epoll = force_epoll;
+  cfg.max_nodes = 128;
+  cfg.max_connections = 8;
+  cfg.token = "s3cret";
+  kestrel::Server server(cfg);
+  CHECK(server.start());
+  const std::string health = http_get(server.port(), "/health");
+  CHECK(health.find(" 200 ") != std::string::npos);
+  const std::string hidden = http_get(server.port(), "/metrics");
+  CHECK(hidden.find(" 401 ") != std::string::npos);
+  const int denied_fd = connect_port(server.port());
+  CHECK(denied_fd >= 0);
+  const std::string denied_req = chat_request("ping", false);
+  CHECK(write_all(denied_fd, denied_req.data(), denied_req.size()));
+  std::string denied;
+  CHECK(read_response(denied_fd, denied));
+  CHECK(denied.find(" 401 ") != std::string::npos);
+  ::close(denied_fd);
+  CHECK(upstream.accepts.load() == 0);
+  const int ok_fd = connect_port(server.port());
+  CHECK(ok_fd >= 0);
+  std::string ok_req = chat_request("ping", false);
+  const std::string marker = "Content-Type: application/json\r\n";
+  const std::size_t at = ok_req.find(marker);
+  CHECK(at != std::string::npos);
+  ok_req.insert(at + marker.size(), "Authorization: Bearer s3cret\r\n");
+  CHECK(write_all(ok_fd, ok_req.data(), ok_req.size()));
+  std::string ok;
+  CHECK(read_response(ok_fd, ok));
+  CHECK(ok.find(" 200 ") != std::string::npos);
+  CHECK(ok.find("pong") != std::string::npos);
+  ::close(ok_fd);
+  CHECK(upstream.accepts.load() == 1);
+  server.stop();
+  upstream.stop();
+}
+
 }  // namespace
 
 int main() {
@@ -555,7 +604,9 @@ int main() {
   test_cluster(false);
   test_metrics(true);
   test_chaos(true);
+  test_token(true);
   test_metrics(false);
   test_chaos(false);
+  test_token(false);
   return kestrel::test::failures.load() == 0 ? 0 : 1;
 }

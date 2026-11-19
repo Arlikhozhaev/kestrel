@@ -37,6 +37,9 @@ struct ServerConfig {
   const char* peers = nullptr;
   // Off unless set. GET /debug and POST /chaos exist only then.
   bool chaos = false;
+  // When set, every request except GET /health and GET /healthz needs
+  // Authorization: Bearer <token>. Empty leaves the port open.
+  const char* token = nullptr;
 };
 
 class Server {
