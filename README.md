@@ -9,9 +9,9 @@ cache and proxies a miss to an IPv4 model server. With `--peer-port` and
 once, keeps the copy, and then hits locally. Only an owner calls the model.
 `GET /metrics` is a Prometheus histogram. `--chaos` adds `GET /debug` and
 `POST /chaos`. The embedder is a feature hash, not a model: paraphrases do not
-hit. The image to run is `ghcr.io/arlikhozhaev/kestrel:0.4.1`. `v0.4.0` still
-shares one vector across different one-token prompts. This tree publishes
-no latency numbers.
+hit. The image to run is `ghcr.io/arlikhozhaev/kestrel:0.4.2`. `v0.4.0` still
+shares one vector across different one-token prompts. `v0.4.1` fixes that and
+does not check a token. This tree publishes no latency numbers.
 
 ## Start here
 
@@ -42,7 +42,7 @@ no latency numbers.
 | 1 | `io_uring` or epoll, HTTP/SSE, HNSW, WAL | this tree |
 | 2 | Consistent hashing, SWIM, replication, circuit breaker | this tree |
 | 3 | HDR histograms, traces, chaos switch | this tree |
-| 4 | `wrk2` harness, Distroless image | harness and Dockerfile in this tree; image published as `0.4.1`; no latency number |
+| 4 | `wrk2` harness, Distroless image | harness and Dockerfile in this tree; image published as `0.4.2`; no latency number |
 
 `kestrel-cli` is not written yet. `liburing` is linked when pkg-config finds it; otherwise the reactor uses epoll.
 
@@ -72,7 +72,7 @@ ctest --test-dir build/tsan --output-on-failure
 GitHub Actions (`.github/workflows/ci.yml`) runs the same three builds on Ubuntu.
 
 ```bash
-docker run --rm -p 8080:8080 ghcr.io/arlikhozhaev/kestrel:0.4.1
+docker run --rm -p 8080:8080 ghcr.io/arlikhozhaev/kestrel:0.4.2
 
 ./build/release/kestreld --bind 127.0.0.1 --port 8080 --wal /tmp/kestrel-wal \
   --upstream 127.0.0.1:8000 --token s3cret
@@ -85,7 +85,7 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"m","messages":[{"role":"user","content":"ping"}]}'
 ```
 
-`curl -d` sends `Content-Length`. A chunked body is a 400, `chunked encoding is not accepted`. The `0.4.1` image does not check a token. `--token` is in this tree: it requires that bearer on every request except `GET /health` and `GET /healthz`. Leave it unset on a machine where the port is already private. The image listens with no upstream, so `GET /health` answers and a chat completion is a 502 until `--upstream` is set. Arguments after the image name replace the default command, so repeat `--bind`, `--port`, and `--wal`. TLS terminates in front of this process. The image has no certificates.
+`curl -d` sends `Content-Length`. A chunked body is a 400, `chunked encoding is not accepted`. The `0.4.2` image checks `--token` when the process is started with it. The default command does not set one. Leave it unset on a machine where the port is already private. In this tree, with `--peers`, a miss accepted on any core is decided on core 0, and a non-owner asks the next owner when the first cannot be reached. The `0.4.2` image does not have that path. The image listens with no upstream, so `GET /health` answers and a chat completion is a 502 until `--upstream` is set. Arguments after the image name replace the default command, so repeat `--bind`, `--port`, and `--wal`. TLS terminates in front of this process. The image has no certificates.
 
 `--epoll` forces the epoll reactor. `--upstream` is `IPv4:PORT`. A miss with no upstream is a 502. `--peer-port` turns the cluster on. `--peers` is `IPv4:PORT,IPv4:PORT` and requires `--peer-port`. `--advertise` is the IPv4 address other processes put in their peer list. `--help` prints the flags. Unknown flags exit 2.
 

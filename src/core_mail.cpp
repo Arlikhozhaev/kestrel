@@ -10,6 +10,7 @@ struct MailHeader {
   std::uint64_t key;
   std::uint32_t kind;
   std::uint32_t conn;
+  std::uint32_t epoch;
   std::uint32_t dim;
   std::uint32_t text_len;
   std::uint32_t response_len;
@@ -121,6 +122,7 @@ bool CoreMail::publish(std::uint32_t from, std::uint32_t to, const MailView& vie
   header.key = view.key;
   header.kind = static_cast<std::uint32_t>(view.kind);
   header.conn = view.conn;
+  header.epoch = view.epoch;
   header.dim = static_cast<std::uint32_t>(view.vector.size());
   header.text_len = static_cast<std::uint32_t>(view.text.size());
   header.response_len = static_cast<std::uint32_t>(view.response.size());
@@ -188,6 +190,7 @@ bool CoreMail::take(std::uint32_t to, std::uint32_t from, MailView& out, float* 
   out.kind = static_cast<MailKind>(header.kind);
   out.key = header.key;
   out.conn = header.conn;
+  out.epoch = header.epoch;
   out.vector = std::span<const float>(vector, header.dim);
   out.text = std::string_view(text, header.text_len);
   out.response = std::string_view(response, header.response_len);

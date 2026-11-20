@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(kestrel VERSION 0.4.2 LANGUAGES CXX)
+project(kestrel VERSION 0.4.3 LANGUAGES CXX)
 
 # Phase 0 host this file was brought up on:
 #   Intel Core i7-8650U, 4 physical cores / 8 logical, SMT pairs (0,1) (2,3) (4,5) (6,7)

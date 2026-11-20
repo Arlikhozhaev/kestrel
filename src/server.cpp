@@ -220,6 +220,7 @@ void rearm(Core& core, Conn& conn);
 void pump_read(Core& core, Conn& conn);
 void drain_upstream(Core& core, Conn& conn);
 void after_client_progress(Core& core, Conn& conn);
+void client_writable(Core& core, Conn& conn);
 
 struct Core {
   Server::Impl* impl = nullptr;
@@ -423,7 +424,6 @@ void close_conn(Core& core, Conn& conn) {
     return;
   }
   conn.closing = true;
-  conn.phase = Phase::Free;
   disarm(core, conn);
   if (conn.fd >= 0) {
     ::close(conn.fd);
@@ -468,6 +468,17 @@ void queue_out(Conn& conn, std::size_t n, bool keep) noexcept {
   conn.request_total = 0;
 }
 
+void flush_out_now(Core& core, Conn& conn) {
+  if (core.ring_ready || conn.closing || conn.phase != Phase::Write || conn.fd < 0) {
+    return;
+  }
+  client_writable(core, conn);
+  if (!conn.closing && conn.phase != Phase::Free) {
+    rearm(core, conn);
+  }
+}
+
+
 void observe(Core& core, Conn& conn, ObserveKind kind) noexcept {
   if (conn.internal || conn.observed || conn.start_us == 0) {
     return;
@@ -485,6 +496,7 @@ void send_status(Core& core, Conn& conn, int status, const char* message) {
     return;
   }
   queue_out(conn, n, false);
+  flush_out_now(core, conn);
 }
 
 void remember(Core& core, Conn& conn) noexcept {
@@ -863,6 +875,23 @@ void drain_upstream(Core& core, Conn& conn) {
   if (conn.phase != Phase::Proxy || conn.up == nullptr) {
     return;
   }
+  if (conn.internal) {
+    // There is no client socket. Parsing the upstream body is the whole job,
+    // and finish sends the fetch reply. Waiting for a client send would stall it.
+    const std::size_t took = take_upstream(conn, reinterpret_cast<const char*>(conn.up), conn.up_len);
+    if (took > 0 && took <= conn.up_len) {
+      const std::size_t rest = conn.up_len - took;
+      if (rest > 0) {
+        std::memmove(conn.up, conn.up + took, rest);
+      }
+      conn.up_len = rest;
+    }
+    if (conn.upstream_done) {
+      conn.up_len = 0;
+      finish_upstream(core, conn);
+    }
+    return;
+  }
   reclaim_out(conn);
   std::size_t off = 0;
   while (off < conn.up_len && !conn.upstream_done) {
@@ -1219,6 +1248,7 @@ void begin_proxy(Core& core, Conn& conn) {
   }
   if (errno == EINPROGRESS) {
     conn.phase = Phase::Connect;
+    rearm(core, conn);
     return;
   }
   fail_connect(core, conn);

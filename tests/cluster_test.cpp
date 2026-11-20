@@ -51,6 +51,8 @@ int main() {
   kestrel::MailView view;
   view.kind = kestrel::MailKind::Replica;
   view.key = 42;
+  view.conn = 3;
+  view.epoch = 9;
   view.vector = sent;
   view.text = "ping";
   view.response = "pong";
@@ -65,6 +67,8 @@ int main() {
   CHECK(mail.take(1, 0, got, got_vec, text, response, model));
   CHECK(got.kind == kestrel::MailKind::Replica);
   CHECK(got.key == 42);
+  CHECK(got.conn == 3);
+  CHECK(got.epoch == 9);
   CHECK(got.text == "ping");
   CHECK(got.response == "pong");
   CHECK(got.model == "m");

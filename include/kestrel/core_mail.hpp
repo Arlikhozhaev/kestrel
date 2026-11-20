@@ -30,6 +30,8 @@ struct MailView {
   MailKind kind = MailKind::Replica;
   std::uint64_t key = 0;
   std::uint32_t conn = 0;
+  // Generation of the client slot. A reply for an older generation is dropped.
+  std::uint32_t epoch = 0;
   std::span<const float> vector{};
   std::string_view text{};
   std::string_view response{};

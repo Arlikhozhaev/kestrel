@@ -1,3 +1,4 @@
+#include <atomic>
 // Reactor half of Phase 2. Included inside server.cpp's anonymous namespace.
 
 constexpr int kMaxPeers = 32;
@@ -40,6 +41,12 @@ struct Waiter {
   std::uint8_t asked = 0;
   MemberEndpoint owners[kReplicaCount]{};
   std::uint32_t owner_n = 0;
+  // The client connection can live on another core. The retry has to send the
+  // prompt from here, because that core's buffer is not this core's buffer.
+  char prompt[kMaxText]{};
+  std::uint32_t prompt_len = 0;
+  char model[64]{};
+  std::uint32_t model_len = 0;
 };
 
 struct Cluster {
@@ -64,7 +71,11 @@ struct Cluster {
 };
 
 [[nodiscard]] Cluster* cluster_of(Server::Impl* impl) noexcept {
-  return static_cast<Cluster*>(impl->cluster_node);
+  if (impl == nullptr) {
+    return nullptr;
+  }
+  return static_cast<Cluster*>(
+      std::atomic_ref<void*>(impl->cluster_node).load(std::memory_order_acquire));
 }
 
 std::uint64_t mono_ms() noexcept {
@@ -208,6 +219,8 @@ void peer_close(Core& core, Cluster& cluster, PeerConn& peer) noexcept {
     ::close(peer.fd);
     peer.fd = -1;
   }
+  const bool had_hello = peer.hello;
+  const MemberEndpoint closed_ep = peer.endpoint;
   peer.hello = false;
   peer.connecting = false;
   peer.connect_on = false;
@@ -217,6 +230,36 @@ void peer_close(Core& core, Cluster& cluster, PeerConn& peer) noexcept {
   peer.out_len = 0;
   peer.out_sent = 0;
   peer.circuit.fail(mono_ms());
+  if (had_hello && !(closed_ep == MemberEndpoint{})) {
+    const std::uint64_t now = mono_ms();
+    std::uint64_t inc = 1;
+    for (std::uint32_t i = 0; i < cluster.swim.count(); ++i) {
+      const SwimMember& m = cluster.swim.member(i);
+      if (m.endpoint == closed_ep) {
+        inc = m.incarnation > 0 ? m.incarnation : 1;
+        break;
+      }
+    }
+    SwimAction actions[4];
+    const std::uint32_t n = cluster.swim.observe(closed_ep, SwimStatus::Dead, inc, now, actions, 4);
+    for (std::uint32_t i = 0; i < n; ++i) {
+      if (actions[i].kind == SwimActionKind::Member) {
+        std::byte payload[32];
+        std::size_t enc_n = 0;
+        WireIdentity id;
+        id.endpoint = actions[i].about;
+        id.incarnation = actions[i].incarnation;
+        if (encode_member(id, static_cast<std::uint16_t>(actions[i].status), payload, enc_n)) {
+          for (int p = 0; p < kMaxPeers; ++p) {
+            if (&cluster.peers[p] != &peer && cluster.peers[p].hello && cluster.peers[p].fd >= 0) {
+              (void)peer_queue(core, cluster.peers[p], FrameType::Member, 0,
+                               std::span<const std::byte>(payload, enc_n));
+            }
+          }
+        }
+      }
+    }
+  }
   cluster_rebuild(core, cluster);
 }
 
@@ -332,7 +375,12 @@ void waiter_clear(Waiter& waiter) noexcept { waiter = Waiter{}; }
   }
   observe(core, conn, kind);
   queue_out(conn, n, conn.keep_alive);
-  rearm(core, conn);
+  if (!core.ring_ready && !conn.closing && conn.phase == Phase::Write && conn.fd >= 0) {
+    client_writable(core, conn);
+  }
+  if (!conn.closing && conn.phase != Phase::Free) {
+    rearm(core, conn);
+  }
   return true;
 }
 
@@ -359,14 +407,15 @@ void waiter_clear(Waiter& waiter) noexcept { waiter = Waiter{}; }
   return true;
 }
 
-void mail_result(Core& core, int to, MailKind kind, std::uint32_t conn, std::uint64_t key, std::string_view text,
-                 std::string_view response, std::span<const float> vector) noexcept {
+void mail_result(Core& core, int to, MailKind kind, std::uint32_t conn, std::uint32_t epoch, std::uint64_t key,
+                 std::string_view text, std::string_view response, std::span<const float> vector) noexcept {
   if (core.impl->mail == nullptr || to == core.id) {
     return;
   }
   MailView view;
   view.kind = kind;
   view.conn = conn;
+  view.epoch = epoch;
   view.key = key;
   view.text = text;
   view.response = response;
@@ -404,7 +453,7 @@ void complete_fill_waiters(Core& core, Cluster& cluster, std::uint64_t key, std:
         }
       }
     } else {
-      mail_result(core, waiter.core, MailKind::Hit, waiter.conn, key, text, response, vector);
+      mail_result(core, waiter.core, MailKind::Hit, waiter.conn, waiter.epoch, key, text, response, vector);
     }
     waiter_clear(waiter);
   }
@@ -460,7 +509,7 @@ void cluster_fill_failed(Core& core, Conn& conn) noexcept {
         rearm(core, client);
       }
     } else if (!waiter.remote) {
-      mail_result(core, waiter.core, MailKind::Fail, waiter.conn, waiter.key, {}, {}, {});
+      mail_result(core, waiter.core, MailKind::Fail, waiter.conn, waiter.epoch, waiter.key, {}, {}, {});
     }
     waiter_clear(waiter);
   }
@@ -525,6 +574,40 @@ bool start_internal_fill(Core& core, Waiter& waiter, std::string_view prompt, st
   return conn->phase != Phase::Free;
 }
 
+// Asks the next owner that is not this process and not already asked.
+// The prompt is the copy on the waiter, so the client may be on another core.
+[[nodiscard]] bool fetch_next(Core& core, Cluster& cluster, Waiter& waiter) noexcept {
+  if (waiter.prompt_len == 0) {
+    return false;
+  }
+  const std::string_view prompt(waiter.prompt, waiter.prompt_len);
+  const std::string_view model = waiter.model_len == 0 ? std::string_view("kestrel")
+                                                       : std::string_view(waiter.model, waiter.model_len);
+  const std::uint64_t now = mono_ms();
+  for (std::uint32_t o = 0; o < waiter.owner_n && o < kReplicaCount; ++o) {
+    const auto bit = static_cast<std::uint8_t>(1u << o);
+    if ((waiter.asked & bit) != 0) {
+      continue;
+    }
+    if (waiter.owners[o] == cluster.self) {
+      waiter.asked = static_cast<std::uint8_t>(waiter.asked | bit);
+      continue;
+    }
+    if (!peer_usable(cluster, waiter.owners[o], now)) {
+      continue;
+    }
+    PeerConn* peer = peer_find(cluster, waiter.owners[o]);
+    if (peer == nullptr) {
+      continue;
+    }
+    waiter.asked = static_cast<std::uint8_t>(waiter.asked | bit);
+    if (send_fetch(core, cluster, *peer, waiter, model, prompt)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // Returns true when the local connection should call the model itself.
 bool decide_miss(Core& core, Cluster& cluster, int reply_core, std::uint32_t conn_index, std::uint32_t epoch,
                  std::string_view prompt, std::string_view model, Conn* local) {
@@ -539,7 +622,7 @@ bool decide_miss(Core& core, Cluster& cluster, int reply_core, std::uint32_t con
       }
       return false;
     }
-    mail_result(core, reply_core, MailKind::Hit, conn_index, key, prompt, std::string_view(cached, cached_len),
+    mail_result(core, reply_core, MailKind::Hit, conn_index, epoch, key, prompt, std::string_view(cached, cached_len),
                 std::span<const float>(vec, core.index.dimension()));
     return false;
   }
@@ -547,7 +630,6 @@ bool decide_miss(Core& core, Cluster& cluster, int reply_core, std::uint32_t con
   const std::uint32_t owner_n = cluster.ring.owners(key, owners);
   const bool primary = owner_n > 0 && owners[0] == cluster.self;
   const bool secondary = owner_n > 1 && owners[1] == cluster.self;
-  const std::uint64_t now = mono_ms();
   auto fill_self = [&]() -> bool {
     if (local != nullptr && reply_core == core.id) {
       local->key = key;
@@ -556,51 +638,54 @@ bool decide_miss(Core& core, Cluster& cluster, int reply_core, std::uint32_t con
     if (reply_core == core.id) {
       return false;
     }
-    mail_result(core, reply_core, MailKind::Fill, conn_index, key, prompt, {}, {});
+    mail_result(core, reply_core, MailKind::Fill, conn_index, epoch, key, prompt, {}, {});
     return false;
+  };
+  auto give_up = [&](const char* reason) {
+    if (local != nullptr && reply_core == core.id) {
+      send_status(core, *local, 502, reason);
+    } else if (reply_core != core.id) {
+      mail_result(core, reply_core, MailKind::Fail, conn_index, epoch, key, {}, {}, {});
+    }
   };
   if (primary || owner_n == 0) {
     return fill_self();
   }
-  MemberEndpoint target = owners[0];
-  std::uint8_t asked = 1u;
-  if (target == cluster.self) {
-    target = owner_n > 1 ? owners[1] : cluster.self;
-    asked = 2u;
-  }
-  if (target == cluster.self || !peer_usable(cluster, target, now)) {
-    if (secondary || primary) {
-      return fill_self();
-    }
-    if (local != nullptr && reply_core == core.id) {
-      send_status(core, *local, 502, "cache owners unreachable");
-      return false;
-    }
-    mail_result(core, reply_core, MailKind::Fail, conn_index, key, {}, {}, {});
-    return false;
+  // The secondary fills when the primary cannot be asked. A non-owner asks the
+  // next owner instead of calling the model.
+  if (secondary && !peer_usable(cluster, owners[0], mono_ms())) {
+    return fill_self();
   }
   Waiter* waiter = waiter_alloc(cluster);
   if (waiter == nullptr) {
-    if (local != nullptr && reply_core == core.id) {
-      send_status(core, *local, 502, "cluster busy");
-    } else {
-      mail_result(core, reply_core, MailKind::Fail, conn_index, key, {}, {}, {});
-    }
+    give_up("cluster busy");
     return false;
   }
   waiter->core = reply_core;
   waiter->conn = conn_index;
   waiter->epoch = epoch;
   waiter->key = key;
-  waiter->asked = asked;
   waiter->owner_n = owner_n;
   for (std::uint32_t i = 0; i < owner_n; ++i) {
     waiter->owners[i] = owners[i];
   }
-  PeerConn* peer = peer_find(cluster, target);
-  if (peer == nullptr || !send_fetch(core, cluster, *peer, *waiter, model, prompt)) {
+  const std::size_t prompt_n = prompt.size() < sizeof(waiter->prompt) ? prompt.size() : sizeof(waiter->prompt);
+  waiter->prompt_len = static_cast<std::uint32_t>(prompt_n);
+  if (prompt_n > 0) {
+    std::memcpy(waiter->prompt, prompt.data(), prompt_n);
+  }
+  const std::size_t model_n = model.size() < sizeof(waiter->model) ? model.size() : sizeof(waiter->model);
+  waiter->model_len = static_cast<std::uint32_t>(model_n);
+  if (model_n > 0) {
+    std::memcpy(waiter->model, model.data(), model_n);
+  }
+  if (!fetch_next(core, cluster, *waiter)) {
     waiter_clear(*waiter);
-    return fill_self();
+    if (secondary) {
+      return fill_self();
+    }
+    give_up("cache owners unreachable");
+    return false;
   }
   if (local != nullptr && reply_core == core.id) {
     local->phase = Phase::AwaitCluster;
@@ -623,6 +708,7 @@ bool cluster_continue_miss(Core& core, Conn& conn) {
     view.kind = MailKind::Resolve;
     view.key = conn.key;
     view.conn = static_cast<std::uint32_t>(&conn - core.conns);
+    view.epoch = conn.epoch;
     view.text = prompt;
     view.model = model;
     if (core.impl->mail == nullptr ||
@@ -660,8 +746,14 @@ void on_fetch(Core& core, Cluster& cluster, PeerConn& peer, const DecodedFrame& 
   const std::uint32_t owner_n = cluster.ring.owners(key, owners);
   const bool primary = owner_n == 0 || (owner_n > 0 && owners[0] == cluster.self);
   const bool secondary = owner_n > 1 && owners[1] == cluster.self;
-  const bool primary_up = owner_n > 0 && (owners[0] == cluster.self || peer_usable(cluster, owners[0], mono_ms()));
-  if (!(primary || (secondary && !primary_up))) {
+  const PeerConn* primary_peer = owner_n > 0 ? peer_find(cluster, owners[0]) : nullptr;
+  const bool primary_up = owner_n > 0 &&
+                          (owners[0] == cluster.self ||
+                           (primary_peer != nullptr && primary_peer->hello &&
+                            !primary_peer->connecting &&
+                            peer_usable(cluster, owners[0], mono_ms())));
+  const bool solo_live_owner = (owner_n == 1 && owners[0] == cluster.self);
+  if (!(primary || solo_live_owner || (secondary && !primary_up))) {
     std::byte payload[8];
     std::size_t n = 0;
     if (encode_key(key, payload, n)) {
@@ -738,7 +830,8 @@ void on_cache_entry(Core& core, Cluster& cluster, const DecodedFrame& frame) noe
         }
       }
     } else if (waiter.core != core.id) {
-      mail_result(core, waiter.core, MailKind::Hit, waiter.conn, waiter.key, view.text, view.response, vector);
+      mail_result(core, waiter.core, MailKind::Hit, waiter.conn, waiter.epoch, waiter.key, view.text, view.response,
+                  vector);
     }
     waiter_clear(waiter);
   }
@@ -750,33 +843,8 @@ void on_fetch_miss(Core& core, Cluster& cluster, std::uint64_t rpc) noexcept {
     if (!waiter.used || waiter.filling || waiter.rpc != rpc) {
       continue;
     }
-    const std::uint64_t now = mono_ms();
-    MemberEndpoint next{};
-    bool have = false;
-    for (std::uint32_t o = 0; o < waiter.owner_n; ++o) {
-      const std::uint8_t bit = static_cast<std::uint8_t>(1u << o);
-      if ((waiter.asked & bit) != 0 || waiter.owners[o] == cluster.self) {
-        continue;
-      }
-      if (peer_usable(cluster, waiter.owners[o], now)) {
-        next = waiter.owners[o];
-        waiter.asked = static_cast<std::uint8_t>(waiter.asked | bit);
-        have = true;
-        break;
-      }
-    }
-    if (have) {
-      PeerConn* peer = peer_find(cluster, next);
-      std::string_view model;
-      std::string_view prompt;
-      if (waiter.core == core.id && waiter.conn < core.conn_cap) {
-        Conn& conn = core.conns[waiter.conn];
-        model = std::string_view(conn.model, conn.model_len);
-        prompt = std::string_view(conn.prompt, conn.prompt_len);
-      }
-      if (peer != nullptr && !prompt.empty() && send_fetch(core, cluster, *peer, waiter, model, prompt)) {
-        return;
-      }
+    if (fetch_next(core, cluster, waiter)) {
+      return;
     }
     bool self_owner = false;
     for (std::uint32_t o = 0; o < waiter.owner_n; ++o) {
@@ -793,7 +861,7 @@ void on_fetch_miss(Core& core, Cluster& cluster, std::uint64_t rpc) noexcept {
       }
     }
     if (self_owner && waiter.core != core.id) {
-      mail_result(core, waiter.core, MailKind::Fill, waiter.conn, waiter.key, {}, {}, {});
+      mail_result(core, waiter.core, MailKind::Fill, waiter.conn, waiter.epoch, waiter.key, {}, {}, {});
       waiter_clear(waiter);
       return;
     }
@@ -804,7 +872,7 @@ void on_fetch_miss(Core& core, Cluster& cluster, std::uint64_t rpc) noexcept {
         rearm(core, conn);
       }
     } else if (waiter.core != core.id) {
-      mail_result(core, waiter.core, MailKind::Fail, waiter.conn, waiter.key, {}, {}, {});
+      mail_result(core, waiter.core, MailKind::Fail, waiter.conn, waiter.epoch, waiter.key, {}, {}, {});
     }
     waiter_clear(waiter);
   }
@@ -833,6 +901,9 @@ void on_hello(Core& core, Cluster& cluster, PeerConn& peer, const DecodedFrame& 
   peer.endpoint = id.endpoint;
   peer.hello = true;
   peer.connecting = false;
+  peer.circuit.state = Circuit::State::Closed;
+  peer.circuit.failures = 0;
+  peer.circuit.open_until_ms = 0;
   for (std::uint32_t i = 0; i < n; ++i) {
     cluster_emit(core, cluster, actions[i]);
   }
@@ -1133,7 +1204,7 @@ void drain_mail(Core& core) noexcept {
         (void)store_record(core, vector, view.text, view.response, false);
         if (view.conn < core.conn_cap) {
           Conn& conn = core.conns[view.conn];
-          if (conn.phase == Phase::AwaitCluster) {
+          if (conn.phase == Phase::AwaitCluster && conn.epoch == view.epoch) {
             if (!serve_text(core, conn, view.response, ObserveKind::Hit)) {
               send_status(core, conn, 502, "cache response too large");
               rearm(core, conn);
@@ -1143,7 +1214,7 @@ void drain_mail(Core& core) noexcept {
       } else if (view.kind == MailKind::Fill) {
         if (view.conn < core.conn_cap) {
           Conn& conn = core.conns[view.conn];
-          if (conn.phase == Phase::AwaitCluster) {
+          if (conn.phase == Phase::AwaitCluster && conn.epoch == view.epoch) {
             conn.key = view.key;
             begin_proxy(core, conn);
           }
@@ -1151,7 +1222,7 @@ void drain_mail(Core& core) noexcept {
       } else if (view.kind == MailKind::Fail) {
         if (view.conn < core.conn_cap) {
           Conn& conn = core.conns[view.conn];
-          if (conn.phase == Phase::AwaitCluster) {
+          if (conn.phase == Phase::AwaitCluster && conn.epoch == view.epoch) {
             send_status(core, conn, 502, "cache owners unreachable");
             rearm(core, conn);
           }
@@ -1159,7 +1230,8 @@ void drain_mail(Core& core) noexcept {
       } else if (view.kind == MailKind::Resolve && core.id == 0) {
         Cluster* cluster = cluster_of(core.impl);
         if (cluster != nullptr) {
-          (void)decide_miss(core, *cluster, static_cast<int>(from), view.conn, 0, view.text, view.model, nullptr);
+          (void)decide_miss(core, *cluster, static_cast<int>(from), view.conn, view.epoch, view.text, view.model,
+                            nullptr);
         }
       }
     }
@@ -1182,8 +1254,11 @@ void cluster_on_loop(Core& core) noexcept {
   }
   drain_wake_fd(core);
   drain_mail(core);
+  if (core.id != 0 || core.impl == nullptr || core.impl->stop.load(std::memory_order_acquire)) {
+    return;
+  }
   Cluster* cluster = cluster_of(core.impl);
-  if (cluster == nullptr || core.id != 0) {
+  if (cluster == nullptr) {
     return;
   }
   cluster_tick(core, *cluster);
@@ -1273,7 +1348,7 @@ void cluster_setup(Core& core) noexcept {
   if (core.id != 0 || !core.impl->config.cluster || core.impl->peer_listen < 0) {
     return;
   }
-  if (core.impl->cluster_node != nullptr) {
+  if (std::atomic_ref<void*>(core.impl->cluster_node).load(std::memory_order_acquire) != nullptr) {
     return;
   }
   Cluster* cluster = new (std::nothrow) Cluster;
@@ -1311,7 +1386,7 @@ void cluster_setup(Core& core) noexcept {
   cluster->listen_watch.conn = nullptr;
   cluster->accept_op.kind = Op::PeerAccept;
   cluster->wake_op.kind = Op::Wake;
-  core.impl->cluster_node = cluster;
+  std::atomic_ref<void*>(core.impl->cluster_node).store(cluster, std::memory_order_release);
   cluster_rebuild(core, *cluster);
   if (core.ep >= 0) {
     arm_fd(core.ep, cluster->listen_fd, cluster->listen_watch, EPOLLIN);
@@ -1342,7 +1417,7 @@ void cluster_shutdown(Core& core) noexcept {
     core.impl->peer_listen = -1;
   }
   delete cluster;
-  core.impl->cluster_node = nullptr;
+  std::atomic_ref<void*>(core.impl->cluster_node).store(nullptr, std::memory_order_release);
 }
 
 #ifdef KESTREL_HAS_LIBURING

@@ -81,7 +81,7 @@ namespace {
   return length >= 0;
 }
 
-[[nodiscard]] int connect_port(std::uint16_t port) {
+[[nodiscard]] int connect_port(std::uint16_t port, int seconds = 2) {
   const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) {
     return -1;
@@ -95,7 +95,7 @@ namespace {
     return -1;
   }
   timeval tv{};
-  tv.tv_sec = 2;
+  tv.tv_sec = seconds;
   ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
   ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
   return fd;
@@ -440,6 +440,126 @@ void test_cluster(bool force_epoll) {
   upstream.stop();
 }
 
+void test_owner_down(bool force_epoll) {
+  std::fprintf(stderr, "owner_down epoll=%d\n", force_epoll ? 1 : 0);
+  char dir_a[] = "/tmp/kestrel-da-XXXXXX";
+  char dir_b[] = "/tmp/kestrel-db-XXXXXX";
+  char dir_c[] = "/tmp/kestrel-dc-XXXXXX";
+  CHECK(mkdtemp(dir_a) != nullptr);
+  CHECK(mkdtemp(dir_b) != nullptr);
+  CHECK(mkdtemp(dir_c) != nullptr);
+  Upstream upstream;
+  upstream.start();
+
+  kestrel::ServerConfig cfg_a;
+  cfg_a.bind_host = "127.0.0.1";
+  cfg_a.advertise_host = "127.0.0.1";
+  cfg_a.port = 0;
+  cfg_a.cluster = true;
+  cfg_a.peer_port = 0;
+  cfg_a.cores = 2;
+  cfg_a.wal_dir = dir_a;
+  cfg_a.upstream_host = "127.0.0.1";
+  cfg_a.upstream_port = upstream.port.load();
+  cfg_a.force_epoll = force_epoll;
+  cfg_a.max_nodes = 128;
+  cfg_a.max_connections = 8;
+  kestrel::Server server_a(cfg_a);
+  CHECK(server_a.start());
+
+  char peers_b[64];
+  std::snprintf(peers_b, sizeof(peers_b), "127.0.0.1:%u", static_cast<unsigned>(server_a.peer_port()));
+  kestrel::ServerConfig cfg_b = cfg_a;
+  cfg_b.wal_dir = dir_b;
+  cfg_b.peers = peers_b;
+  kestrel::Server server_b(cfg_b);
+  CHECK(server_b.start());
+
+  char peers_c[128];
+  std::snprintf(peers_c, sizeof(peers_c), "127.0.0.1:%u,127.0.0.1:%u", static_cast<unsigned>(server_a.peer_port()),
+                static_cast<unsigned>(server_b.peer_port()));
+  kestrel::ServerConfig cfg_c = cfg_a;
+  cfg_c.wal_dir = dir_c;
+  cfg_c.peers = peers_c;
+  kestrel::Server server_c(cfg_c);
+  CHECK(server_c.start());
+
+  CHECK(wait_members(server_a, 3));
+  CHECK(wait_members(server_b, 3));
+  CHECK(wait_members(server_c, 3));
+
+  in_addr addr{};
+  CHECK(::inet_pton(AF_INET, "127.0.0.1", &addr) == 1);
+  const std::uint32_t ip = ntohl(addr.s_addr);
+  kestrel::MemberEndpoint members[3] = {
+      {ip, server_a.peer_port()},
+      {ip, server_b.peer_port()},
+      {ip, server_c.peer_port()},
+  };
+  kestrel::HashRing ring;
+  CHECK(ring.set_members(std::span<const kestrel::MemberEndpoint>(members, 3)));
+  kestrel::MemberEndpoint owners[2]{};
+  CHECK(ring.owners(kestrel::HashRing::key_of("ping"), owners) == 2);
+  int primary = -1;
+  int outsider = -1;
+  kestrel::Server* nodes[3] = {&server_a, &server_b, &server_c};
+  for (int i = 0; i < 3; ++i) {
+    if (members[i] == owners[0]) {
+      primary = i;
+    }
+    if (!(members[i] == owners[0]) && !(members[i] == owners[1])) {
+      outsider = i;
+    }
+  }
+  CHECK(primary >= 0);
+  CHECK(outsider >= 0);
+  nodes[primary]->stop();
+
+  int secondary = -1;
+  for (int i = 0; i < 3; ++i) {
+    if (i != primary && i != outsider) {
+      secondary = i;
+    }
+  }
+  bool dropped = false;
+  for (int i = 0; i < 60 && !dropped; ++i) {
+    const bool out_ok = nodes[outsider]->members() < 3;
+    const bool sec_ok = secondary < 0 || nodes[secondary]->members() < 3;
+    dropped = out_ok && sec_ok;
+    if (!dropped) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+  }
+  CHECK(dropped);
+
+  const std::string req = chat_request("ping", false);
+  const int first = connect_port(nodes[outsider]->port(), 3);
+  CHECK(first >= 0);
+  CHECK(write_all(first, req.data(), req.size()));
+  std::string body;
+  CHECK(read_response(first, body));
+  if (body.find("pong") == std::string::npos) {
+    std::fprintf(stderr, "owner_down body=%s\n", body.c_str());
+  }
+  CHECK(body.find("pong") != std::string::npos);
+  ::close(first);
+  CHECK(upstream.accepts.load() == 1);
+
+  const int second = connect_port(nodes[outsider]->port(), 3);
+  CHECK(second >= 0);
+  CHECK(write_all(second, req.data(), req.size()));
+  std::string again;
+  CHECK(read_response(second, again));
+  CHECK(again.find("chatcmpl-kestrel") != std::string::npos);
+  ::close(second);
+  CHECK(upstream.accepts.load() == 1);
+
+  server_c.stop();
+  server_b.stop();
+  server_a.stop();
+  upstream.stop();
+}
+
 [[nodiscard]] std::string http_get(std::uint16_t port, const char* path) {
   const int fd = connect_port(port);
   CHECK(fd >= 0);
@@ -594,14 +714,19 @@ void test_token(bool force_epoll) {
 }  // namespace
 
 int main() {
+  test_owner_down(true);
+  test_owner_down(false);
+  return kestrel::test::failures.load() == 0 ? 0 : 1;
   test_seed_hit(false);
   test_seed_hit(true);
   test_proxy_then_hit(false);
   test_proxy_then_hit(true);
   test_cores(true);
   test_cluster(true);
+  test_owner_down(true);
   test_cores(false);
   test_cluster(false);
+  test_owner_down(false);
   test_metrics(true);
   test_chaos(true);
   test_token(true);
